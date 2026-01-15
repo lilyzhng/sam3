@@ -1,0 +1,420 @@
+# @package _global_
+# ============================================================================
+# Factory Stage 2: Temporal Adaptation (Video Tracking)
+# ============================================================================
+# Usage:
+#   python sam3/train/train.py -c configs/factory/factory_stage2_temporal.yaml --use-cluster 0 --num-gpus 1
+#
+# This config fine-tunes the Stage 1 checkpoint for video tracking/temporal stability.
+# Key differences from Stage 1:
+#   - Uses VideoGroundingDataset for video clips
+#   - Loads Stage 1 checkpoint as initialization
+#   - Uses video model (build_sam3_video_model)
+#   - Separate loss weights for detection vs tracking queries
+#   - Fewer epochs (video training is more compute-intensive)
+# ============================================================================
+
+defaults:
+  - _self_
+
+# ============================================================================
+# Paths Configuration (CHANGE THESE TO YOUR PATHS)
+# ============================================================================
+paths:
+  # Directory containing your factory video frames (as JPEG folders)
+  factory_video_root: /path/to/your/factory_videos
+  # Where to save logs and checkpoints
+  experiment_log_dir: /path/to/your/experiments/factory_stage2
+  # BPE tokenizer path
+  bpe_path: /Users/lilyzhang/Desktop/Archive/Qwen2.5-VL/sam3_repo/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  # IMPORTANT: Path to Stage 1 checkpoint
+  stage1_checkpoint: /path/to/your/experiments/factory_stage1/checkpoints/checkpoint.pt
+
+# ============================================================================
+# Factory Video Dataset Configuration
+# ============================================================================
+factory_video_train:
+  # Number of videos to use (null = all)
+  num_videos: null
+  
+  # Training transforms pipeline for video
+  train_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+          query_filter:
+            _target_: sam3.train.transforms.filter_query_transforms.FilterCrowds
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes:
+            _target_: sam3.train.transforms.basic.get_random_resize_scales
+            size: ${scratch.resolution}
+            min_size: 480
+            rounded: false
+          max_size:
+            _target_: sam3.train.transforms.basic.get_random_resize_max_size
+            size: ${scratch.resolution}
+          square: true
+          consistent_transform: true  # Important: consistent across frames
+        - _target_: sam3.train.transforms.basic_for_api.PadToSizeAPI
+          size: ${scratch.resolution}
+          consistent_transform: true
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+          query_filter:
+            _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: ${scratch.train_norm_mean}
+          std: ${scratch.train_norm_std}
+        - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+          query_filter:
+            _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
+    - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+      query_filter:
+        _target_: sam3.train.transforms.filter_query_transforms.FilterFindQueriesWithTooManyOut
+        max_num_objects: ${scratch.max_ann_per_img}
+
+  # Validation transforms pipeline
+  val_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          max_size:
+            _target_: sam3.train.transforms.basic.get_random_resize_max_size
+            size: ${scratch.resolution}
+          square: true
+          consistent_transform: true
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: ${scratch.val_norm_mean}
+          std: ${scratch.val_norm_std}
+
+  # Loss config for video training
+  # Key: separate loss weights for detection vs tracking queries
+  loss:
+    _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
+    matcher: ${scratch.matcher}
+    o2m_weight: 2.0
+    o2m_matcher:
+      _target_: sam3.train.matcher.BinaryOneToManyMatcher
+      alpha: 0.3
+      threshold: 0.4
+      topk: 4
+    use_o2m_matcher_on_o2m_aux: false
+    normalize_by_stage_num: true  # Normalize loss across video frames
+    loss_fns_find:
+      # Box losses
+      - _target_: sam3.train.loss.loss_fns.Boxes
+        weight_dict:
+          loss_bbox: 5.0
+          loss_giou: 2.0
+        apply_loss_to_det_queries_in_video_grounding: true
+      # Classification loss with tracking-specific settings
+      - _target_: sam3.train.loss.loss_fns.IABCEMdetr
+        weak_loss: False
+        weight_dict:
+          loss_ce: 20.0
+          presence_loss: 20.0
+        pos_weight: 10.0
+        alpha: 0.25
+        gamma: 2
+        use_presence: True
+        pos_focal: false
+        pad_n_queries: 200
+        pad_scale_pos: 1.0
+        # Separate detection vs tracking loss weights
+        use_separate_loss_for_det_and_trk: true
+        det_exhaustive_loss_scale_pos: 1.0
+        det_exhaustive_loss_scale_neg: 1.0
+        trk_loss_scale_pos: 2.0  # Weight tracking consistency higher
+        trk_loss_scale_neg: 1.0
+        apply_loss_to_det_queries_in_video_grounding: true
+      # Mask losses
+      - _target_: sam3.train.loss.loss_fns.Masks
+        focal_alpha: 0.25
+        focal_gamma: 2.0
+        weight_dict:
+          loss_mask: 200.0
+          loss_dice: 10.0
+        compute_aux: false
+        apply_loss_to_det_queries_in_video_grounding: true
+    loss_fn_semantic_seg: null
+    scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
+
+# ============================================================================
+# Scratch Parameters
+# ============================================================================
+scratch:
+  enable_segmentation: True
+  
+  # Model parameters
+  d_model: 256
+  pos_embed:
+    _target_: sam3.model.position_encoding.PositionEmbeddingSine
+    num_pos_feats: ${scratch.d_model}
+    normalize: true
+    scale: null
+    temperature: 10000
+
+  # Box processing
+  use_presence_eval: True
+  vid_mask_postprocessor:
+    _target_: sam3.eval.postprocessors.PostProcessNullOp
+
+  # Matcher configuration
+  matcher:
+    _target_: sam3.train.matcher.BinaryHungarianMatcherV2
+    focal: true
+    cost_class: 2.0
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    alpha: 0.25
+    gamma: 2
+    stable: False
+  scale_by_find_batch_size: True
+
+  # Image processing parameters
+  resolution: 1008
+  consistent_transform: true  # Consistent across video frames
+  max_ann_per_img: 100
+
+  # Normalization parameters
+  train_norm_mean: [0.5, 0.5, 0.5]
+  train_norm_std: [0.5, 0.5, 0.5]
+  val_norm_mean: [0.5, 0.5, 0.5]
+  val_norm_std: [0.5, 0.5, 0.5]
+
+  # Training parameters - Video specific
+  num_train_workers: 4
+  num_val_workers: 0
+  max_data_epochs: 20  # Fewer epochs for video (more compute per epoch)
+  hybrid_repeats: 1
+  gather_pred_via_filesys: false
+
+  # Video sampling parameters
+  num_stages_sample: 4     # Number of frames per training clip
+  stage_stride_min: 1      # Minimum stride between frames
+  stage_stride_max: 5      # Maximum stride (for temporal variety)
+  max_masklet_num_in_video: 50  # Factory usually has fewer objects
+
+  # Learning rate - slightly lower than Stage 1 (fine-tuning)
+  lr_scale: 0.05  # Half of Stage 1
+  lr_transformer: ${times:8e-4,${scratch.lr_scale}}
+  lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
+  lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
+  lrd_vision_backbone: 0.9
+  wd: 0.1
+  scheduler_timescale: 10
+  scheduler_warmup: 10
+  scheduler_cooldown: 10
+
+  val_batch_size: 1
+  train_batch_size: 1
+  gradient_accumulation_steps: 2  # Effective batch size of 2
+
+  collate_fn_val:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: factory_video
+    with_seg_masks: ${scratch.enable_segmentation}
+
+  collate_fn:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: all
+    with_seg_masks: ${scratch.enable_segmentation}
+
+# ============================================================================
+# Trainer Configuration
+# ============================================================================
+trainer:
+  _target_: sam3.train.trainer.Trainer
+  skip_saving_ckpts: false
+  empty_gpu_mem_cache_after_eval: True
+  skip_first_val: True
+  max_epochs: 20
+  accelerator: cuda
+  seed_value: 123
+  val_epoch_freq: 5
+  mode: train
+  gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: True
+    gradient_as_bucket_view: True
+
+  loss:
+    all: ${factory_video_train.loss}
+    default:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+
+  data:
+    train:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        # VIDEO DATASET - Key difference from Stage 1
+        _target_: sam3.train.data.sam3_video_dataset.VideoGroundingDataset
+        limit_ids: ${factory_video_train.num_videos}
+        transforms: ${factory_video_train.train_transforms}
+        load_segmentation: ${scratch.enable_segmentation}
+        max_ann_per_img: 100000
+        multiplier: 1
+        max_train_queries: 50000
+        max_val_queries: 50000
+        training: true
+        use_caching: False
+        # Video-specific parameters
+        num_stages_sample: ${scratch.num_stages_sample}
+        stage_stride_min: ${scratch.stage_stride_min}
+        stage_stride_max: ${scratch.stage_stride_max}
+        random_reverse_time_axis: true
+        max_masklet_num_in_video: ${scratch.max_masklet_num_in_video}
+        override_query_is_exhaustive_to_true: true
+        # YOUR DATA PATHS - Video frames as JPEG folders
+        img_folder: ${paths.factory_video_root}/train/
+        ann_file: ${paths.factory_video_root}/train/annotations.json
+
+      shuffle: True
+      batch_size: ${scratch.train_batch_size}
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: True
+      collate_fn: ${scratch.collate_fn}
+
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_video_dataset.VideoGroundingDataset
+        load_segmentation: ${scratch.enable_segmentation}
+        img_folder: ${paths.factory_video_root}/val/
+        ann_file: ${paths.factory_video_root}/val/annotations.json
+        transforms: ${factory_video_train.val_transforms}
+        max_ann_per_img: 100000
+        multiplier: 1
+        training: false
+        num_stages_sample: 8  # More frames for validation
+        stage_stride_min: 1
+        stage_stride_max: 1
+
+      shuffle: False
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: True
+      drop_last: False
+      collate_fn: ${scratch.collate_fn_val}
+
+  # VIDEO MODEL - Key difference from Stage 1
+  model:
+    _target_: sam3.model_builder.build_sam3_video_model
+    bpe_path: ${paths.bpe_path}
+    has_presence_token: True
+    geo_encoder_use_img_cross_attn: True
+    apply_temporal_disambiguation: True
+
+  meters:
+    val:
+      factory_video:
+        pred_file:
+          _target_: sam3.eval.ytvis_eval.YTVISResultsWriter
+          dump_file: ${launcher.experiment_log_dir}/preds/factory_video_val.json
+          postprocessor: ${scratch.vid_mask_postprocessor}
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+
+  optim:
+    amp:
+      enabled: True
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: sam3.train.optim.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+
+    param_group_modifiers:
+      - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
+        _partial_: True
+        layer_decay_value: ${scratch.lrd_vision_backbone}
+        apply_to: 'backbone.vision_backbone.trunk'
+        overrides:
+          - pattern: '*pos_embed*'
+            value: 1.0
+
+    options:
+      lr:
+        - scheduler:
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_transformer}
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+        - scheduler:
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_vision_backbone}
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+          param_names:
+            - 'backbone.vision_backbone.*'
+        - scheduler:
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_language_backbone}
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+          param_names:
+            - 'backbone.language_backbone.*'
+
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: ${scratch.wd}
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - '*bias*'
+          module_cls_names: ['torch.nn.LayerNorm']
+
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 5
+    # LOAD STAGE 1 CHECKPOINT
+    resume_from: ${paths.stage1_checkpoint}
+
+  logging:
+    tensorboard_writer:
+      _target_: sam3.train.utils.logger.make_tensorboard_logger
+      log_dir: ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: True
+    wandb_writer: null
+    log_dir: ${launcher.experiment_log_dir}/logs/factory_stage2
+    log_freq: 10
+
+# ============================================================================
+# Launcher and Submitit Configuration
+# ============================================================================
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
+  experiment_log_dir: ${paths.experiment_log_dir}
+  multiprocessing_context: forkserver
+
+submitit:
+  account: null
+  partition: null
+  qos: null
+  timeout_hour: 72
+  use_cluster: False
+  cpus_per_task: 4
+  port_range: [10000, 65000]
+  constraint: null
+
