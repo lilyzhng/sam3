@@ -4,17 +4,79 @@ A comprehensive guide for fine-tuning SAM3 (Segment Anything 3) for factory and 
 
 ---
 
+## 🚀 Execution Order (Start Here!)
+
+This guide is organized into **phases**. Complete each phase before moving to the next.
+
+### Phase 0: Pipeline Validation (Do This First!)
+
+**Goal:** Verify the training pipeline works before using your own data.
+
+| Step | Action | Dataset | Config |
+|------|--------|---------|--------|
+| 0.1 | Download Roboflow-100 | [Roboflow-100](https://universe.roboflow.com/roboflow-100) | Existing SAM3 config |
+| 0.2 | Run Stage 1 training | Roboflow-100 (images) | `roboflow_v100_full_ft_100_images.yaml` |
+| 0.3 | Verify training completes | Check loss curves, checkpoints | — |
+
+**Why Roboflow-100?** SAM3 already has working configs for this dataset. No data conversion needed.
+
+```bash
+# Example command for Phase 0
+python sam3/train/train.py -c sam3/train/configs/roboflow_v100/roboflow_v100_full_ft_100_images.yaml \
+    --use-cluster 0 --num-gpus 1
+```
+
+**✅ Success criteria:** Training runs without errors, loss decreases, checkpoint is saved.
+
+---
+
+### Phase 1: Two-Stage Training with YouTube-VOS
+
+**Goal:** Validate the full two-stage (spatial → temporal) pipeline.
+
+**⚠️ Important:** Both stages must use the **same dataset domain**. Otherwise the temporal stage can't track objects the spatial stage didn't learn.
+
+| Step | Action | Dataset | Format |
+|------|--------|---------|--------|
+| 1.1 | Download YouTube-VOS | [YouTube-VOS](https://youtube-vos.org/dataset/vos/) | YTVIS-style |
+| 1.2 | Extract frames for Stage 1 | YouTube-VOS frames | Convert to COCO format |
+| 1.3 | Run Stage 1 (spatial) | YouTube-VOS frames as images | Custom config |
+| 1.4 | Run Stage 2 (temporal) | YouTube-VOS full videos | Custom config (loads Stage 1 checkpoint) |
+
+**Why YouTube-VOS?** 
+- SAM3 was NOT trained on it (unlike SA-V)
+- Has both frames (for Stage 1) AND video sequences (for Stage 2)
+- Same objects appear in both stages → proper transfer learning
+
+---
+
+### Phase 2: Factory Domain Adaptation
+
+**Goal:** Fine-tune for your specific factory environment.
+
+| Step | Action | Dataset |
+|------|--------|---------|
+| 2.1 | Collect factory images | 300-500 images with masks |
+| 2.2 | Collect factory videos | 50-100 video clips with tracking annotations |
+| 2.3 | Run Stage 1 (spatial) | Factory images |
+| 2.4 | Run Stage 2 (temporal) | Factory videos |
+
+**⚠️ Key insight:** For real factory deployment, you need factory-domain data for BOTH stages.
+
+---
+
 ## Table of Contents
 
 1. [Overview](#overview)
 2. [Prerequisites](#prerequisites)
-3. [Stage 1: Spatial Adaptation (Images)](#stage-1-spatial-adaptation-images)
-4. [Stage 2: Temporal Adaptation (Video)](#stage-2-temporal-adaptation-video)
-5. [Data Preparation Scripts](#data-preparation-scripts)
-6. [Training Commands](#training-commands)
-7. [Monitoring & Evaluation](#monitoring--evaluation)
-8. [Troubleshooting](#troubleshooting)
-9. [Best Practices](#best-practices)
+3. [Phase 0: Pipeline Validation with Roboflow-100](#phase-0-pipeline-validation-with-roboflow-100)
+4. [Phase 1: Two-Stage Training with YouTube-VOS](#phase-1-two-stage-training-with-youtube-vos)
+5. [Phase 2: Factory Domain Adaptation](#phase-2-factory-domain-adaptation)
+6. [Data Preparation Scripts](#data-preparation-scripts)
+7. [Training Commands](#training-commands)
+8. [Monitoring & Evaluation](#monitoring--evaluation)
+9. [Troubleshooting](#troubleshooting)
+10. [Best Practices](#best-practices)
 
 ---
 
@@ -27,8 +89,10 @@ SAM3 has two main capabilities:
 2. **Temporal understanding** - Tracking objects across video frames
 
 Training these separately ensures:
-- Stage 1 teaches the model **what** to segment in your factory domain
+- Stage 1 teaches the model **what** to segment in your target domain
 - Stage 2 teaches the model **how to track** those objects over time
+
+**⚠️ Critical:** Both stages must use data from the **same domain**. Using different datasets (e.g., Roboflow for Stage 1, YouTube-VOS for Stage 2) will NOT work because the model learns different objects in each stage.
 
 ### Training Strategy Summary
 
@@ -44,6 +108,16 @@ Training these separately ensures:
 - **Layer-wise LR decay** - Earlier layers learn slower
 - **Mixed precision (BF16)** - Faster training, lower memory
 - **Activation checkpointing** - Reduces GPU memory usage
+
+### Dataset Selection Guide
+
+| Dataset | SAM3 trained on it? | Use for fine-tuning? | Notes |
+|---------|---------------------|----------------------|-------|
+| SA-V | ✅ Yes | ❌ No | Already seen during SAM3 training |
+| SA-Co/VEval | ✅ Yes | ❌ No | Use for evaluation only |
+| Roboflow-100 | ❌ No | ✅ Yes (Stage 1 only) | Good for pipeline validation |
+| YouTube-VOS | ❌ No | ✅ Yes (both stages) | Best for two-stage validation |
+| Your factory data | ❌ No | ✅ Yes (both stages) | Required for production |
 
 ---
 
@@ -85,6 +159,149 @@ SAM3 checkpoints require access approval:
 # Generate token at https://huggingface.co/settings/tokens
 huggingface-cli login
 ```
+
+---
+
+## Phase 0: Pipeline Validation with Roboflow-100
+
+**⏱️ Time required:** 2-4 hours (including download and training)
+
+### Goal
+
+Validate that the SAM3 training pipeline works on your system before investing time in data preparation.
+
+### Step 0.1: Download Roboflow-100
+
+Roboflow-100 is a collection of 100 diverse datasets. For validation, we'll use a single subset.
+
+```bash
+# Create data directory
+mkdir -p data/roboflow100
+
+# Option A: Download via Roboflow CLI (recommended)
+pip install roboflow
+python -c "
+from roboflow import Roboflow
+rf = Roboflow(api_key='YOUR_API_KEY')  # Get from https://roboflow.com/settings/api
+project = rf.workspace('roboflow-100').project('cells-uyemf')  # Example: cells dataset
+dataset = project.version(2).download('coco', location='data/roboflow100/cells')
+"
+
+# Option B: Download manually from https://universe.roboflow.com/roboflow-100
+# Look for datasets with 'coco' export format
+```
+
+### Step 0.2: Update Config Paths
+
+Edit `sam3/train/configs/roboflow_v100/roboflow_v100_full_ft_100_images.yaml`:
+
+```yaml
+paths:
+  roboflow_base_path: /absolute/path/to/data/roboflow100
+  experiment_log_dir: /absolute/path/to/experiments/roboflow_validation
+```
+
+### Step 0.3: Run Training
+
+```bash
+# Single GPU training
+python sam3/train/train.py \
+    -c sam3/train/configs/roboflow_v100/roboflow_v100_full_ft_100_images.yaml \
+    --use-cluster 0 \
+    --num-gpus 1
+
+# Monitor training (in another terminal)
+tail -f /path/to/experiments/roboflow_validation/logs/*.log
+```
+
+### Step 0.4: Verify Success
+
+Check for:
+- [ ] Training starts without errors
+- [ ] Loss decreases over epochs
+- [ ] Checkpoint files are created in `checkpoints/` directory
+- [ ] Validation metrics are logged
+
+**✅ If all checks pass:** Proceed to Phase 1 or Phase 2.
+
+**❌ If training fails:** See [Troubleshooting](#troubleshooting) section.
+
+---
+
+## Phase 1: Two-Stage Training with YouTube-VOS
+
+**⏱️ Time required:** 1-2 days (including download, conversion, and training)
+
+### Goal
+
+Validate the full two-stage pipeline using a dataset SAM3 hasn't seen.
+
+### Step 1.1: Download YouTube-VOS
+
+```bash
+# Create data directory
+mkdir -p data/youtube_vos
+
+# Download from https://youtube-vos.org/dataset/vos/
+# You'll need to register and accept the license
+# Download: train.zip, valid.zip
+
+# Extract
+unzip train.zip -d data/youtube_vos/
+unzip valid.zip -d data/youtube_vos/
+```
+
+Expected structure:
+```
+data/youtube_vos/
+├── train/
+│   ├── JPEGImages/
+│   │   ├── video_001/
+│   │   │   ├── 00000.jpg
+│   │   │   ├── 00005.jpg
+│   │   │   └── ...
+│   │   └── video_002/
+│   └── Annotations/
+│       ├── video_001/
+│       │   ├── 00000.png
+│       │   └── ...
+│       └── video_002/
+└── valid/
+    └── ...
+```
+
+### Step 1.2: Convert Frames to COCO Format (Stage 1)
+
+```bash
+# Run conversion script (see Data Preparation Scripts section)
+python scripts/convert_ytvos_to_coco.py \
+    --input-dir data/youtube_vos/train \
+    --output-dir data/youtube_vos_images \
+    --sample-rate 5  # Take every 5th frame
+```
+
+### Step 1.3: Run Stage 1 (Spatial)
+
+```bash
+python sam3/train/train.py \
+    -c sam3/train/configs/youtube_vos/ytvos_stage1_spatial.yaml \
+    --use-cluster 0 --num-gpus 1
+```
+
+### Step 1.4: Run Stage 2 (Temporal)
+
+```bash
+# Update config to point to Stage 1 checkpoint
+python sam3/train/train.py \
+    -c sam3/train/configs/youtube_vos/ytvos_stage2_temporal.yaml \
+    --use-cluster 0 --num-gpus 1
+```
+
+---
+
+## Phase 2: Factory Domain Adaptation
+
+This is the main section for production factory fine-tuning.
 
 ---
 
