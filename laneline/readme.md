@@ -30,6 +30,9 @@ python sam3_lane_inference.py --mode video --scene scene-1094
 ### Additional Options
 ```bash
 # Use native SAM3 implementation (CUDA only, potentially faster)
+python laneline/sam3_lane_inference.py --mode video-file --video-file /workspace/data/nuscenes/turn.mov --output-dir /workspace/data/nuscenes/sam3_output --single-frame 24
+
+
 python sam3_lane_inference.py --mode frame --use-native-sam3
 
 # Custom confidence threshold
@@ -45,3 +48,5 @@ python sam3_lane_inference.py --mode frame --device cuda
 - `scene-0103`: Hard visibility/lighting stress
 - `scene-0916`: Topology complexity stress
 - `scene-1094`: Adverse condition (night + rain)
+
+

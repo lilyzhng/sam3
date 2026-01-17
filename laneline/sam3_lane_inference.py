@@ -228,9 +228,8 @@ class NuScenesLoader:
 class Sam3LaneInference:
     """SAM3-based lane detection inference (per-frame mode, no temporal tracking).
     
-    Uses HuggingFace Transformers implementation which works on CPU, MPS, and CUDA.
-    On CUDA, can optionally use the native SAM3 repo implementation for better performance
-    (requires sam3 repo installed with triton).
+    Uses native SAM3 implementation on CUDA (same as video mode).
+    Falls back to HuggingFace Transformers on CPU/MPS if available.
     """
     
     def __init__(
@@ -238,7 +237,7 @@ class Sam3LaneInference:
         model_id: str = "facebook/sam3",
         device: Optional[str] = None,
         confidence_threshold: float = 0.3,
-        use_native_sam3: bool = False,
+        use_native_sam3: bool = True,  # Default to native for consistency with video mode
     ):
         """Initialize SAM3 lane inference.
         
@@ -266,13 +265,14 @@ class Sam3LaneInference:
         print(f"Using device: {self.device}")
         
         # Determine which implementation to use
+        # On CUDA, prefer native SAM3 (same as video mode) for consistency
         self.use_native = False
-        if use_native_sam3 and self.device == "cuda":
+        if self.device == "cuda":
             try:
                 from sam3.model_builder import build_sam3_image_model
                 from sam3.model.sam3_image_processor import Sam3Processor as NativeSam3Processor
                 self.use_native = True
-                print("Using native SAM3 implementation (CUDA + triton)")
+                print("Using native SAM3 implementation (CUDA)")
             except ImportError as e:
                 print(f"Native SAM3 not available ({e}), falling back to HuggingFace transformers")
                 self.use_native = False
@@ -1009,7 +1009,7 @@ def run_video_mode(args, loader: NuScenesLoader, target_scenes: list[SceneConfig
         inferencer.shutdown()
 
 
-def render_mask_only_frame(img, outputs, frame_idx=None, alpha=0.5):
+def render_mask_only_frame(img, outputs, frame_idx=None, alpha=0.5, color_map=None):
     """Render masks only (no bounding boxes or labels) on a frame.
     
     Args:
@@ -1017,6 +1017,9 @@ def render_mask_only_frame(img, outputs, frame_idx=None, alpha=0.5):
         outputs: dict with keys: out_obj_ids, out_binary_masks
         frame_idx: int or None, for overlaying frame index text
         alpha: float, mask overlay alpha
+        color_map: dict mapping obj_id ranges to RGB colors. If None, uses default colors.
+                   Format: {(start_id, end_id): [R, G, B], ...}
+                   Or: {type_idx: [R, G, B], ...} where type_idx = obj_id // 100
     Returns:
         overlay: np.ndarray, shape (H, W, 3), uint8
     """
@@ -1032,8 +1035,20 @@ def render_mask_only_frame(img, outputs, frame_idx=None, alpha=0.5):
     
     for i in range(len(outputs["out_obj_ids"])):
         obj_id = outputs["out_obj_ids"][i]
-        color = COLORS[obj_id % len(COLORS)]
-        color255 = (color * 255).astype(np.uint8)
+        
+        # Determine color based on lane type (obj_id // 100 gives the type index)
+        if color_map is not None:
+            type_idx = obj_id // 100
+            if type_idx in color_map:
+                color255 = np.array(color_map[type_idx], dtype=np.uint8)
+            else:
+                # Fallback to default colors
+                color = COLORS[obj_id % len(COLORS)]
+                color255 = (color * 255).astype(np.uint8)
+        else:
+            color = COLORS[obj_id % len(COLORS)]
+            color255 = (color * 255).astype(np.uint8)
+        
         mask = outputs["out_binary_masks"][i]
         if mask.shape != img.shape[:2]:
             mask = cv2.resize(
@@ -1063,7 +1078,7 @@ def render_mask_only_frame(img, outputs, frame_idx=None, alpha=0.5):
     return overlay
 
 
-def save_mask_only_video(video_frames, outputs, out_path, alpha=0.5, fps=10, show_frame_numbers=True):
+def save_mask_only_video(video_frames, outputs, out_path, alpha=0.5, fps=10, show_frame_numbers=True, color_map=None):
     """Save video with mask overlays only (no bounding boxes).
     
     Args:
@@ -1073,6 +1088,7 @@ def save_mask_only_video(video_frames, outputs, out_path, alpha=0.5, fps=10, sho
         alpha: mask overlay alpha
         fps: frames per second
         show_frame_numbers: whether to show frame numbers on video
+        color_map: dict mapping type_idx to RGB colors for lane types
     """
     import subprocess
     from sam3.visualization_utils import load_frame
@@ -1095,7 +1111,7 @@ def save_mask_only_video(video_frames, outputs, out_path, alpha=0.5, fps=10, sho
     for frame, frame_idx, frame_outputs in tqdm(outputs_list, desc="Rendering video"):
         img = load_frame(frame)
         frame_num = frame_idx if show_frame_numbers else None
-        overlay = render_mask_only_frame(img, frame_outputs, frame_idx=frame_num, alpha=alpha)
+        overlay = render_mask_only_frame(img, frame_outputs, frame_idx=frame_num, alpha=alpha, color_map=color_map)
         writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     
     writer.release()
@@ -1124,15 +1140,35 @@ def run_video_file_frame_mode(args, config: dict):
     print(f"(No temporal tracking - each frame processed independently)")
     print(f"{'='*60}\n")
     
-    # Get prompts from config
+    # Use lane_types from config (new format) or fall back to prompts (old format)
+    lane_types = config.get("lane_types", None)
+    
     if args.prompts:
+        # CLI override - simple prompts list
         prompts = [p.strip() for p in args.prompts.split(",")]
+        lane_types = None
+    elif lane_types:
+        # New config format with lane types and colors
+        prompts = [lt["prompt"] for lt in lane_types]
+        print("\nUsing lane types:")
+        for lt in lane_types:
+            color_str = f"RGB{tuple(lt['color'])}"
+            print(f"  - {lt['name']}: '{lt['prompt']}' -> {color_str}")
     elif "prompts" in config:
+        # Old config format - simple prompts list
         prompts = config["prompts"]
+        lane_types = None
     else:
         prompts = DEFAULT_LANE_PROMPTS
+        lane_types = None
     
-    print(f"Using prompts: {prompts}")
+    if not lane_types:
+        print(f"Using prompts: {prompts}")
+    
+    # Build color map from lane types
+    color_map = None
+    if lane_types:
+        color_map = {i: lt["color"] for i, lt in enumerate(lane_types)}
     
     # Get inference settings
     inference_config = config.get("inference", {})
@@ -1222,16 +1258,42 @@ def run_video_file_frame_mode(args, config: dict):
         alpha=alpha,
         fps=fps,
         show_frame_numbers=show_frame_numbers,
+        color_map=color_map,
     )
+    
+    # Save individual frame images if enabled
+    save_frame_images = output_config.get("save_frame_images", False)
+    frame_output_dir = None
+    if save_frame_images:
+        # Create sam3_frame_output/<timestamp>/ folder structure
+        frame_output_base = output_dir / "sam3_frame_output"
+        frame_output_dir = frame_output_base / (timestamp if timestamp else "default")
+        frame_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"\nSaving frame images to: {frame_output_dir}")
+        for frame_idx in tqdm(sorted(all_outputs.keys()), desc="Saving frames"):
+            frame_rgb = video_frames[frame_idx]
+            frame_outputs = all_outputs[frame_idx]
+            # Render frame without frame number overlay
+            overlay = render_mask_only_frame(
+                frame_rgb, frame_outputs, frame_idx=None, alpha=alpha, color_map=color_map
+            )
+            # Save as JPEG
+            frame_path = frame_output_dir / f"frame_{frame_idx:04d}.jpg"
+            cv2.imwrite(str(frame_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        
+        print(f"Saved {len(all_outputs)} frame images")
     
     # Save summary
     summary = {
         "input_video": str(video_path),
         "output_video": str(output_video_path),
+        "frame_output_dir": str(frame_output_dir) if frame_output_dir else None,
         "timestamp": timestamp,
         "total_frames": total_frames,
         "fps": fps,
         "prompts_used": prompts,
+        "lane_types": lane_types if lane_types else None,
         "mode": "frame",
         "config_file": str(args.config) if args.config else "default",
     }
@@ -1242,6 +1304,8 @@ def run_video_file_frame_mode(args, config: dict):
     print(f"\n{'='*60}")
     print("Frame-by-frame processing complete!")
     print(f"Output video: {output_video_path}")
+    if frame_output_dir:
+        print(f"Frame images: {frame_output_dir}")
     print(f"Summary: {summary_path}")
     print(f"{'='*60}")
 
@@ -1325,20 +1389,42 @@ def run_video_file_tracking(args, config: dict):
         session_id = response["session_id"]
         print(f"Session started: {session_id}")
         
-        # Use prompts from args, config, or defaults (in that priority order)
+        # Use lane_types from config (new format) or fall back to prompts (old format)
+        lane_types = config.get("lane_types", None)
+        
         if args.prompts:
+            # CLI override - simple prompts list
             prompts = [p.strip() for p in args.prompts.split(",")]
+            lane_types = None  # Will use default colors
+        elif lane_types:
+            # New config format with lane types and colors
+            prompts = [lt["prompt"] for lt in lane_types]
+            print("\nUsing lane types:")
+            for lt in lane_types:
+                color_str = f"RGB{tuple(lt['color'])}"
+                print(f"  - {lt['name']}: '{lt['prompt']}' -> {color_str}")
         elif "prompts" in config:
+            # Old config format - simple prompts list
             prompts = config["prompts"]
+            lane_types = None
         else:
             prompts = DEFAULT_LANE_PROMPTS
+            lane_types = None
         
-        print(f"\nUsing prompts: {prompts}")
+        if not lane_types:
+            print(f"\nUsing prompts: {prompts}")
+        
+        # Build color map from lane types (maps type_idx to RGB color)
+        color_map = None
+        if lane_types:
+            color_map = {i: lt["color"] for i, lt in enumerate(lane_types)}
         
         # Get inference settings from config
         inference_config = config.get("inference", {})
         alpha = inference_config.get("alpha", 0.5)
         show_frame_numbers = inference_config.get("show_frame_numbers", True)
+        # Use prompt_frame from config if available, otherwise from args
+        prompt_frame = inference_config.get("prompt_frame", args.prompt_frame)
         
         # Process each prompt
         all_outputs = {}
@@ -1353,9 +1439,6 @@ def run_video_file_tracking(args, config: dict):
                     session_id=session_id,
                 )
             )
-            
-            # Add text prompt on first frame
-            prompt_frame = args.prompt_frame
             print(f"Adding text prompt on frame {prompt_frame}...")
             response = predictor.handle_request(
                 request=dict(
@@ -1477,17 +1560,43 @@ def run_video_file_tracking(args, config: dict):
             alpha=alpha,
             fps=fps,
             show_frame_numbers=show_frame_numbers,
+            color_map=color_map,
         )
+        
+        # Save individual frame images if enabled
+        save_frame_images = output_config.get("save_frame_images", False)
+        frame_output_dir = None
+        if save_frame_images:
+            # Create sam3_frame_output/<timestamp>/ folder structure
+            frame_output_base = output_dir / "sam3_frame_output"
+            frame_output_dir = frame_output_base / (timestamp if timestamp else "default")
+            frame_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            print(f"\nSaving frame images to: {frame_output_dir}")
+            for frame_idx in tqdm(sorted(all_outputs.keys()), desc="Saving frames"):
+                frame_rgb = video_frames_for_vis[frame_idx]
+                frame_outputs = all_outputs[frame_idx]
+                # Render frame without frame number overlay
+                overlay = render_mask_only_frame(
+                    frame_rgb, frame_outputs, frame_idx=None, alpha=alpha, color_map=color_map
+                )
+                # Save as JPEG
+                frame_path = frame_output_dir / f"frame_{frame_idx:04d}.jpg"
+                cv2.imwrite(str(frame_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+            
+            print(f"Saved {len(all_outputs)} frame images")
         
         # Save summary
         summary = {
             "input_video": str(video_path),
             "output_video": str(output_video_path),
+            "frame_output_dir": str(frame_output_dir) if frame_output_dir else None,
             "timestamp": timestamp,
             "total_frames": total_frames,
             "fps": fps,
             "prompts_used": prompts,
-            "prompt_frame": args.prompt_frame,
+            "lane_types": lane_types if lane_types else None,
+            "prompt_frame": prompt_frame,
             "config_file": str(args.config) if args.config else "default",
         }
         
@@ -1497,12 +1606,142 @@ def run_video_file_tracking(args, config: dict):
         print(f"\n{'='*60}")
         print("Video tracking complete!")
         print(f"Output video: {output_video_path}")
+        if frame_output_dir:
+            print(f"Frame images: {frame_output_dir}")
         print(f"Summary: {summary_path}")
         print(f"{'='*60}")
     
     finally:
         # Shutdown predictor
         predictor.shutdown()
+
+
+def run_single_frame_inference(args, config: dict):
+    """Run inference on a single frame from a video file.
+    
+    This is much faster than processing all frames when you only need one.
+    """
+    from datetime import datetime
+    from PIL import Image
+    
+    video_path = Path(args.video_file)
+    if not video_path.exists():
+        print(f"Error: Video file not found: {video_path}")
+        return
+    
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    frame_idx = args.single_frame
+    
+    print(f"\n{'='*60}")
+    print(f"Running SAM3 SINGLE FRAME inference on: {video_path}")
+    print(f"Frame index: {frame_idx}")
+    print(f"{'='*60}\n")
+    
+    # Extract the single frame from video
+    print(f"Extracting frame {frame_idx}...")
+    cap = cv2.VideoCapture(str(video_path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    if frame_idx >= total_frames:
+        print(f"Error: Frame {frame_idx} out of range (video has {total_frames} frames)")
+        cap.release()
+        return
+    
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+    
+    if not ret:
+        print(f"Error: Could not read frame {frame_idx}")
+        return
+    
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(frame_rgb)
+    print(f"Frame size: {image.size[0]}x{image.size[1]}")
+    
+    # Get lane types from config
+    lane_types = config.get("lane_types", None)
+    if lane_types:
+        prompts = [lt["prompt"] for lt in lane_types]
+        print("\nUsing lane types:")
+        for lt in lane_types:
+            color_str = f"RGB{tuple(lt['color'])}"
+            print(f"  - {lt['name']}: '{lt['prompt']}' -> {color_str}")
+        color_map = {i: lt["color"] for i, lt in enumerate(lane_types)}
+    elif "prompts" in config:
+        prompts = config["prompts"]
+        color_map = None
+        print(f"Using prompts: {prompts}")
+    else:
+        prompts = ["white paint on road"]
+        color_map = None
+        print(f"Using default prompts: {prompts}")
+    
+    # Get inference settings
+    inference_config = config.get("inference", {})
+    alpha = inference_config.get("alpha", 0.7)
+    confidence_threshold = inference_config.get("confidence_threshold", 0.3)
+    
+    # Initialize inferencer
+    print("\nInitializing SAM3 inference...")
+    inferencer = Sam3LaneInference(
+        device=args.device,
+        confidence_threshold=confidence_threshold,
+    )
+    
+    # Run inference
+    print(f"Running inference on frame {frame_idx}...")
+    results = inferencer.run_inference(image, prompts)
+    
+    # Convert results to output format
+    masks = []
+    obj_ids = []
+    probs = []
+    
+    for prompt_idx, (prompt, data) in enumerate(results.items()):
+        print(f"  '{prompt}': {data['num_detections']} detection(s)")
+        for i, mask in enumerate(data["masks"]):
+            masks.append(mask)
+            obj_ids.append(prompt_idx * 100 + i)
+            probs.append(data["scores"][i] if i < len(data["scores"]) else 1.0)
+    
+    frame_outputs = {
+        "out_obj_ids": np.array(obj_ids),
+        "out_probs": np.array(probs),
+        "out_binary_masks": np.stack(masks, axis=0) if masks else np.array([]),
+    }
+    
+    # Render the frame with masks
+    overlay = render_mask_only_frame(
+        frame_rgb, frame_outputs, frame_idx=None, alpha=alpha, color_map=color_map
+    )
+    
+    # Generate output path with timestamp
+    output_config = config.get("output", {})
+    use_timestamp = output_config.get("timestamp_prefix", True)
+    
+    if use_timestamp:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        frame_output_base = output_dir / "sam3_frame_output"
+        frame_output_dir = frame_output_base / timestamp
+    else:
+        timestamp = None
+        frame_output_base = output_dir / "sam3_frame_output"
+        frame_output_dir = frame_output_base / "default"
+    
+    frame_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save the frame
+    frame_path = frame_output_dir / f"frame_{frame_idx:04d}.jpg"
+    cv2.imwrite(str(frame_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    
+    print(f"\n{'='*60}")
+    print("Single frame inference complete!")
+    print(f"Output: {frame_path}")
+    print(f"Detections: {len(obj_ids)} object(s)")
+    print(f"{'='*60}")
 
 
 def main():
@@ -1591,6 +1830,12 @@ def main():
         action="store_true",
         help="Use native SAM3 repo implementation instead of HuggingFace (requires CUDA + triton)",
     )
+    parser.add_argument(
+        "--single-frame",
+        type=int,
+        default=None,
+        help="Process only a single frame (e.g., --single-frame 24). Saves just that frame image.",
+    )
     
     args = parser.parse_args()
     
@@ -1602,6 +1847,12 @@ def main():
         
         # Load config to determine video vs frame mode
         config = load_config(args.config)
+        
+        # Handle single-frame mode
+        if args.single_frame is not None:
+            run_single_frame_inference(args, config)
+            return
+        
         video_mode = config.get("mode", "video")  # Default to video tracking
         
         print(f"Config mode: {video_mode}")

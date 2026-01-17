@@ -9,45 +9,38 @@
 #              Each frame is processed independently. Faster but no temporal consistency.
 mode: "video"
 
-# Text prompts for lane detection
-# 
-# IMPORTANT: SAM3 text prompts work best when:
-# 1. Using a SINGLE comprehensive prompt per semantic class
-# 2. Being specific about the visual appearance
-# 3. Avoiding overly generic terms
+# Lane type definitions with prompts and colors
+# Each lane type gets:
+#   - A specific text prompt for detection
+#   - A unique color for visualization
+#   - All instances of that type share the same color
 #
-# The prompt strategy affects how objects are grouped:
-# - Multiple prompts = each prompt creates separate object IDs
-# - Single prompt = all detected instances share grouping logic
-prompts:
-  # RECOMMENDED: Single comprehensive prompt for lane lines
-  # This treats all lane markings as instances of the same class
-  - "painted lane line on road"
-  
-  # Alternative prompts to try (uncomment one set):
-  #
-  # Option A: Focus on the paint/marking itself
-  # - "white painted line on asphalt"
-  #
-  # Option B: Be very specific about lane dividers
-  # - "lane divider marking"
-  #
-  # Option C: Multiple prompts for different line types (creates separate colors)
-  # - "white dashed lane line"
-  # - "white solid lane line"
-  # - "road edge line"
+# NOTE: For nighttime/low-light videos, use simpler, more general prompts
+# SAM3 works better with visual descriptions rather than semantic labels
+lane_types:
+  - name: "lane_marking"
+    prompt: "white paint on road"
+    color: [0, 255, 255]  # Cyan
+    
+  - name: "curb_marking"
+    prompt: "painted curb"
+    color: [255, 0, 255]  # Magenta
+
+  - name: "dotted_line"
+    prompt: "dotted line on road"
+    color: [0, 255, 0]  # Green
 
 # Inference settings
 inference:
   # Frame to add initial text prompts (0 = first frame)
-  # TIP: If frame 0 has poor visibility, try a different frame
-  prompt_frame: 0
+  # TIP: If frame 0 has poor visibility, try a later frame with clearer lane markings
+  prompt_frame: 24
   
   # Mask overlay transparency (0.0 = invisible, 1.0 = opaque)
-  alpha: 0.6
+  alpha: 0.7
   
   # Whether to show frame numbers on output video
-  show_frame_numbers: true
+  show_frame_numbers: false
   
   # Confidence threshold for detections (only used in frame mode)
   confidence_threshold: 0.3
@@ -56,6 +49,9 @@ inference:
 output:
   # Add timestamp prefix to output files (prevents overwriting)
   timestamp_prefix: true
+  
+  # Save individual frame images to sam3_frame_output/<timestamp>/frame_XX.jpg
+  save_frame_images: true
   
   # Output video codec
   codec: "mp4v"
