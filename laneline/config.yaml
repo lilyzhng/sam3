@@ -1,0 +1,62 @@
+# SAM3 Lane Line Detection Configuration
+# ==========================================
+
+# Inference mode for video files:
+#   - "video": Session-based video tracking with temporal propagation (recommended)
+#              Objects are detected on prompt_frame and tracked across all frames.
+#              Provides temporal consistency - same object keeps same ID across frames.
+#   - "frame": Per-frame inference without temporal tracking
+#              Each frame is processed independently. Faster but no temporal consistency.
+mode: "video"
+
+# Text prompts for lane detection
+# 
+# IMPORTANT: SAM3 text prompts work best when:
+# 1. Using a SINGLE comprehensive prompt per semantic class
+# 2. Being specific about the visual appearance
+# 3. Avoiding overly generic terms
+#
+# The prompt strategy affects how objects are grouped:
+# - Multiple prompts = each prompt creates separate object IDs
+# - Single prompt = all detected instances share grouping logic
+prompts:
+  # RECOMMENDED: Single comprehensive prompt for lane lines
+  # This treats all lane markings as instances of the same class
+  - "painted lane line on road"
+  
+  # Alternative prompts to try (uncomment one set):
+  #
+  # Option A: Focus on the paint/marking itself
+  # - "white painted line on asphalt"
+  #
+  # Option B: Be very specific about lane dividers
+  # - "lane divider marking"
+  #
+  # Option C: Multiple prompts for different line types (creates separate colors)
+  # - "white dashed lane line"
+  # - "white solid lane line"
+  # - "road edge line"
+
+# Inference settings
+inference:
+  # Frame to add initial text prompts (0 = first frame)
+  # TIP: If frame 0 has poor visibility, try a different frame
+  prompt_frame: 0
+  
+  # Mask overlay transparency (0.0 = invisible, 1.0 = opaque)
+  alpha: 0.6
+  
+  # Whether to show frame numbers on output video
+  show_frame_numbers: true
+  
+  # Confidence threshold for detections (only used in frame mode)
+  confidence_threshold: 0.3
+
+# Output settings
+output:
+  # Add timestamp prefix to output files (prevents overwriting)
+  timestamp_prefix: true
+  
+  # Output video codec
+  codec: "mp4v"
+
