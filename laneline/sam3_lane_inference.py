@@ -1036,9 +1036,11 @@ def render_mask_only_frame(img, outputs, frame_idx=None, alpha=0.5, color_map=No
     for i in range(len(outputs["out_obj_ids"])):
         obj_id = outputs["out_obj_ids"][i]
         
-        # Determine color based on lane type (obj_id // 100 gives the type index)
+        # Determine color based on lane type
+        # Object ID format: prompt_idx * 1000 + prompt_frame_idx * 100 + detection_idx
+        # So prompt_idx (lane type) = obj_id // 1000
         if color_map is not None:
-            type_idx = obj_id // 100
+            type_idx = obj_id // 1000  # Extract lane type from object ID
             if type_idx in color_map:
                 color255 = np.array(color_map[type_idx], dtype=np.uint8)
             else:
@@ -1423,80 +1425,110 @@ def run_video_file_tracking(args, config: dict):
         inference_config = config.get("inference", {})
         alpha = inference_config.get("alpha", 0.5)
         show_frame_numbers = inference_config.get("show_frame_numbers", True)
-        # Use prompt_frame from config if available, otherwise from args
-        prompt_frame = inference_config.get("prompt_frame", args.prompt_frame)
         
-        # Process each prompt
+        # Determine prompt frames to use
+        # Priority: prompt_interval > prompt_frames > prompt_frame > args.prompt_frame
+        prompt_interval = inference_config.get("prompt_interval", None)
+        prompt_frames_config = inference_config.get("prompt_frames", None)
+        single_prompt_frame = inference_config.get("prompt_frame", args.prompt_frame)
+        
+        if prompt_interval is not None:
+            # Generate frames at regular intervals: 0, interval, 2*interval, ...
+            prompt_frames = list(range(0, total_frames, prompt_interval))
+            print(f"\nUsing prompt_interval={prompt_interval}: detecting on {len(prompt_frames)} frames")
+            print(f"Prompt frames: {prompt_frames[:10]}{'...' if len(prompt_frames) > 10 else ''}")
+        elif prompt_frames_config is not None:
+            prompt_frames = prompt_frames_config
+            print(f"\nUsing multiple prompt frames: {prompt_frames}")
+        else:
+            prompt_frames = [single_prompt_frame]
+            print(f"\nUsing single prompt frame: {single_prompt_frame}")
+        
+        # Process each prompt on each prompt frame
         all_outputs = {}
         
         for prompt_idx, prompt in enumerate(prompts):
             print(f"\n--- Processing prompt {prompt_idx + 1}/{len(prompts)}: '{prompt}' ---")
             
-            # Reset session for new prompt
-            predictor.handle_request(
-                request=dict(
-                    type="reset_session",
-                    session_id=session_id,
+            total_detections = 0
+            
+            for pf_idx, prompt_frame in enumerate(prompt_frames):
+                # Reset session for each prompt frame
+                predictor.handle_request(
+                    request=dict(
+                        type="reset_session",
+                        session_id=session_id,
+                    )
                 )
-            )
-            print(f"Adding text prompt on frame {prompt_frame}...")
-            response = predictor.handle_request(
-                request=dict(
-                    type="add_prompt",
-                    session_id=session_id,
-                    frame_index=prompt_frame,
-                    text=prompt,
-                )
-            )
-            
-            # Check initial detection
-            initial_out = response["outputs"]
-            num_objects = len(initial_out.get("out_obj_ids", []))
-            print(f"Initial detection: {num_objects} object(s)")
-            
-            if num_objects == 0:
-                print(f"No objects detected for prompt '{prompt}'")
-                continue
-            
-            # Propagate through video
-            print("Propagating through video...")
-            outputs_per_frame = {}
-            for prop_response in predictor.handle_stream_request(
-                request=dict(
-                    type="propagate_in_video",
-                    session_id=session_id,
-                )
-            ):
-                outputs_per_frame[prop_response["frame_index"]] = prop_response["outputs"]
-            
-            print(f"Propagated to {len(outputs_per_frame)} frames")
-            
-            # Merge outputs (combine all prompts)
-            for frame_idx, frame_out in outputs_per_frame.items():
-                if frame_idx not in all_outputs:
-                    all_outputs[frame_idx] = {
-                        "out_obj_ids": [],
-                        "out_probs": [],
-                        "out_binary_masks": [],
-                        "out_boxes_xywh": [],
-                    }
                 
-                # Add offset to object IDs to keep them unique across prompts
-                obj_id_offset = prompt_idx * 100
-                for i, obj_id in enumerate(frame_out["out_obj_ids"]):
-                    new_obj_id = int(obj_id) + obj_id_offset
-                    all_outputs[frame_idx]["out_obj_ids"].append(new_obj_id)
+                if len(prompt_frames) > 1:
+                    print(f"  Frame {prompt_frame} ({pf_idx + 1}/{len(prompt_frames)})...", end=" ")
+                else:
+                    print(f"Adding text prompt on frame {prompt_frame}...")
+                
+                response = predictor.handle_request(
+                    request=dict(
+                        type="add_prompt",
+                        session_id=session_id,
+                        frame_index=prompt_frame,
+                        text=prompt,
+                    )
+                )
+                
+                # Check initial detection
+                initial_out = response["outputs"]
+                num_objects = len(initial_out.get("out_obj_ids", []))
+                
+                if len(prompt_frames) > 1:
+                    print(f"{num_objects} detection(s)")
+                else:
+                    print(f"Initial detection: {num_objects} object(s)")
+                
+                if num_objects == 0:
+                    continue
+                
+                total_detections += num_objects
+                
+                # Propagate through video from this prompt frame
+                outputs_per_frame = {}
+                for prop_response in predictor.handle_stream_request(
+                    request=dict(
+                        type="propagate_in_video",
+                        session_id=session_id,
+                    )
+                ):
+                    outputs_per_frame[prop_response["frame_index"]] = prop_response["outputs"]
+                
+                # Merge outputs (combine all prompts and prompt frames)
+                # Use unique offset: prompt_idx * 1000 + pf_idx * 100 to avoid ID collisions
+                obj_id_offset = prompt_idx * 1000 + pf_idx * 100
+                
+                for frame_idx, frame_out in outputs_per_frame.items():
+                    if frame_idx not in all_outputs:
+                        all_outputs[frame_idx] = {
+                            "out_obj_ids": [],
+                            "out_probs": [],
+                            "out_binary_masks": [],
+                            "out_boxes_xywh": [],
+                        }
                     
-                    if "out_probs" in frame_out and len(frame_out["out_probs"]) > i:
-                        all_outputs[frame_idx]["out_probs"].append(frame_out["out_probs"][i])
-                    else:
-                        all_outputs[frame_idx]["out_probs"].append(1.0)
-                    
-                    if "out_binary_masks" in frame_out and len(frame_out["out_binary_masks"]) > i:
-                        all_outputs[frame_idx]["out_binary_masks"].append(frame_out["out_binary_masks"][i])
-                    
-                    if "out_boxes_xywh" in frame_out and len(frame_out["out_boxes_xywh"]) > i:
-                        all_outputs[frame_idx]["out_boxes_xywh"].append(frame_out["out_boxes_xywh"][i])
+                    for i, obj_id in enumerate(frame_out["out_obj_ids"]):
+                        new_obj_id = int(obj_id) + obj_id_offset
+                        all_outputs[frame_idx]["out_obj_ids"].append(new_obj_id)
+                        
+                        if "out_probs" in frame_out and len(frame_out["out_probs"]) > i:
+                            all_outputs[frame_idx]["out_probs"].append(frame_out["out_probs"][i])
+                        else:
+                            all_outputs[frame_idx]["out_probs"].append(1.0)
+                        
+                        if "out_binary_masks" in frame_out and len(frame_out["out_binary_masks"]) > i:
+                            all_outputs[frame_idx]["out_binary_masks"].append(frame_out["out_binary_masks"][i])
+                        
+                        if "out_boxes_xywh" in frame_out and len(frame_out["out_boxes_xywh"]) > i:
+                            all_outputs[frame_idx]["out_boxes_xywh"].append(frame_out["out_boxes_xywh"][i])
+            
+            if len(prompt_frames) > 1:
+                print(f"  Total detections for '{prompt}': {total_detections}")
         
         # Convert lists to numpy arrays for visualization
         for frame_idx in all_outputs:
@@ -1538,18 +1570,26 @@ def run_video_file_tracking(args, config: dict):
             print("\nNo detections found for any prompt")
             return
         
-        # Generate timestamp for unique output filename
+        # Generate timestamp and create output folder structure
+        # Structure: sam3_video_output/<timestamp>/
+        #   - video.mp4
+        #   - summary.json
+        #   - frame_XXXX.jpg (extracted frames)
         output_config = config.get("output", {})
         use_timestamp = output_config.get("timestamp_prefix", True)
         
         if use_timestamp:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_video_path = output_dir / f"{timestamp}_{video_path.stem}_lane_tracking.mp4"
-            summary_path = output_dir / f"{timestamp}_{video_path.stem}_summary.json"
         else:
-            timestamp = None
-            output_video_path = output_dir / f"{video_path.stem}_lane_tracking.mp4"
-            summary_path = output_dir / f"{video_path.stem}_summary.json"
+            timestamp = "default"
+        
+        # Create output folder: sam3_video_output/<timestamp>/
+        video_output_base = output_dir / "sam3_video_output"
+        video_output_dir = video_output_base / timestamp
+        video_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        output_video_path = video_output_dir / f"{video_path.stem}_lane_tracking.mp4"
+        summary_path = video_output_dir / "summary.json"
         
         # Save output video (mask only, no bounding boxes)
         print(f"\nSaving output video to: {output_video_path}")
@@ -1563,16 +1603,10 @@ def run_video_file_tracking(args, config: dict):
             color_map=color_map,
         )
         
-        # Save individual frame images if enabled
+        # Save individual frame images if enabled (all frames)
         save_frame_images = output_config.get("save_frame_images", False)
-        frame_output_dir = None
         if save_frame_images:
-            # Create sam3_frame_output/<timestamp>/ folder structure
-            frame_output_base = output_dir / "sam3_frame_output"
-            frame_output_dir = frame_output_base / (timestamp if timestamp else "default")
-            frame_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            print(f"\nSaving frame images to: {frame_output_dir}")
+            print(f"\nSaving all frame images to: {video_output_dir}")
             for frame_idx in tqdm(sorted(all_outputs.keys()), desc="Saving frames"):
                 frame_rgb = video_frames_for_vis[frame_idx]
                 frame_outputs = all_outputs[frame_idx]
@@ -1581,7 +1615,7 @@ def run_video_file_tracking(args, config: dict):
                     frame_rgb, frame_outputs, frame_idx=None, alpha=alpha, color_map=color_map
                 )
                 # Save as JPEG
-                frame_path = frame_output_dir / f"frame_{frame_idx:04d}.jpg"
+                frame_path = video_output_dir / f"frame_{frame_idx:04d}.jpg"
                 cv2.imwrite(str(frame_path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
             
             print(f"Saved {len(all_outputs)} frame images")
@@ -1590,13 +1624,14 @@ def run_video_file_tracking(args, config: dict):
         summary = {
             "input_video": str(video_path),
             "output_video": str(output_video_path),
-            "frame_output_dir": str(frame_output_dir) if frame_output_dir else None,
+            "output_dir": str(video_output_dir),
             "timestamp": timestamp,
             "total_frames": total_frames,
             "fps": fps,
             "prompts_used": prompts,
             "lane_types": lane_types if lane_types else None,
-            "prompt_frame": prompt_frame,
+            "prompt_frames": prompt_frames,
+            "prompt_interval": prompt_interval,
             "config_file": str(args.config) if args.config else "default",
         }
         
@@ -1605,10 +1640,11 @@ def run_video_file_tracking(args, config: dict):
         
         print(f"\n{'='*60}")
         print("Video tracking complete!")
-        print(f"Output video: {output_video_path}")
-        if frame_output_dir:
-            print(f"Frame images: {frame_output_dir}")
-        print(f"Summary: {summary_path}")
+        print(f"Output folder: {video_output_dir}")
+        print(f"Video: {output_video_path.name}")
+        print(f"Summary: {summary_path.name}")
+        if save_frame_images:
+            print(f"Frames: frame_0000.jpg - frame_{total_frames-1:04d}.jpg")
         print(f"{'='*60}")
     
     finally:
@@ -1744,6 +1780,78 @@ def run_single_frame_inference(args, config: dict):
     print(f"{'='*60}")
 
 
+def extract_frames_from_video(args):
+    """Extract specific frames from an existing video inference result.
+    
+    Usage:
+        python sam3_lane_inference.py --extract-frames sam3_video_output/20260117_221308 --frames 24,50
+    """
+    import glob
+    
+    output_folder = Path(args.extract_frames)
+    
+    # Check if it's a relative path under output_dir
+    if not output_folder.exists():
+        # Try relative to output_dir
+        output_folder = Path(args.output_dir) / args.extract_frames
+    
+    if not output_folder.exists():
+        print(f"Error: Output folder not found: {args.extract_frames}")
+        print(f"Tried: {Path(args.extract_frames)} and {Path(args.output_dir) / args.extract_frames}")
+        return
+    
+    # Find the video file
+    video_files = list(output_folder.glob("*.mp4"))
+    if not video_files:
+        print(f"Error: No video file found in {output_folder}")
+        return
+    
+    video_path = video_files[0]
+    print(f"\n{'='*60}")
+    print(f"Extracting frames from: {video_path}")
+    print(f"{'='*60}\n")
+    
+    # Parse frame indices
+    if not args.frames:
+        print("Error: --frames is required (e.g., --frames 24,50)")
+        return
+    
+    frame_indices = [int(f.strip()) for f in args.frames.split(",")]
+    print(f"Extracting frames: {frame_indices}")
+    
+    # Open video
+    cap = cv2.VideoCapture(str(video_path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    print(f"Video has {total_frames} frames")
+    
+    extracted_count = 0
+    for frame_idx in frame_indices:
+        if frame_idx >= total_frames:
+            print(f"Warning: Frame {frame_idx} out of range (max {total_frames-1}), skipping")
+            continue
+        
+        # Seek to frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        
+        if not ret:
+            print(f"Warning: Could not read frame {frame_idx}, skipping")
+            continue
+        
+        # Save frame to same folder
+        frame_path = output_folder / f"frame_{frame_idx:04d}.jpg"
+        cv2.imwrite(str(frame_path), frame)
+        print(f"Saved: {frame_path.name}")
+        extracted_count += 1
+    
+    cap.release()
+    
+    print(f"\n{'='*60}")
+    print(f"Extracted {extracted_count} frame(s) to: {output_folder}")
+    print(f"{'='*60}")
+
+
 def main():
     """Main entry point."""
     import argparse
@@ -1836,8 +1944,19 @@ def main():
         default=None,
         help="Process only a single frame (e.g., --single-frame 24). Saves just that frame image.",
     )
+    parser.add_argument(
+        "--extract-frames",
+        type=str,
+        default=None,
+        help="Extract specific frames from existing video result. Provide path to output folder (e.g., sam3_video_output/20260117_221308) and frame indices with --frames.",
+    )
     
     args = parser.parse_args()
+    
+    # Handle extract-frames mode (extract frames from existing video result)
+    if args.extract_frames is not None:
+        extract_frames_from_video(args)
+        return
     
     # Handle video-file mode
     if args.mode == "video-file":

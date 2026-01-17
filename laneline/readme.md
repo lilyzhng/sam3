@@ -29,9 +29,17 @@ python sam3_lane_inference.py --mode video --scene scene-1094
 
 ### Additional Options
 ```bash
-# Use native SAM3 implementation (CUDA only, potentially faster)
-python laneline/sam3_lane_inference.py --mode video-file --video-file /workspace/data/nuscenes/turn.mov --output-dir /workspace/data/nuscenes/sam3_output --single-frame 24
+# single frame mode
+python laneline/sam3_lane_inference.py --mode video-file --video-file /workspace/data/nuscenes/turn.mov --output-dir /workspace/data/nuscenes/sam3_output --single-frame 50
 
+# video mode
+# Make sure config.yaml has: mode: "video"
+python laneline/sam3_lane_inference.py --mode video-file --video-file /workspace/data/nuscenes/turn.mov --output-dir /workspace/data/nuscenes/sam3_output
+
+# extract frame 
+python laneline/sam3_lane_inference.py --extract-frames /workspace/data/nuscenes/sam3_output/sam3_video_output/20260117_230848 --frames 24 --output-dir /workspace/data/nuscenes/sam3_output 2>&1
+
+# Use native SAM3 implementation (CUDA only, potentially faster)
 
 python sam3_lane_inference.py --mode frame --use-native-sam3
 

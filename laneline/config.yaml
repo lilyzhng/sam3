@@ -32,15 +32,21 @@ lane_types:
 
 # Inference settings
 inference:
-  # Frame to add initial text prompts (0 = first frame)
-  # TIP: If frame 0 has poor visibility, try a later frame with clearer lane markings
-  prompt_frame: 24
+  # Frame(s) to add text prompts for detection
+  # Options:
+  #   - Single frame: prompt_frame: 24
+  #   - Multiple frames: prompt_frames: [0, 24, 50]
+  #   - Every N frames: prompt_interval: 5  (detects on frames 0, 5, 10, 15, ...)
+  # 
+  # Using prompt_interval gives better coverage but takes longer.
+  # Recommended: prompt_interval: 5-10 for good balance of accuracy and speed.
+  prompt_interval: 10  # Detect every 5 frames for better coverage
   
   # Mask overlay transparency (0.0 = invisible, 1.0 = opaque)
   alpha: 0.7
   
   # Whether to show frame numbers on output video
-  show_frame_numbers: false
+  show_frame_numbers: true
   
   # Confidence threshold for detections (only used in frame mode)
   confidence_threshold: 0.3
@@ -50,8 +56,8 @@ output:
   # Add timestamp prefix to output files (prevents overwriting)
   timestamp_prefix: true
   
-  # Save individual frame images to sam3_frame_output/<timestamp>/frame_XX.jpg
-  save_frame_images: true
+  # Save individual frame images (all frames) - set to false to save only on extract
+  save_frame_images: false
   
   # Output video codec
   codec: "mp4v"
