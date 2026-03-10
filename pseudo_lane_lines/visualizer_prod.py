@@ -106,7 +106,8 @@ def _save_lidar_projection_overlay(
 ) -> None:
     """Project LiDAR onto raw camera image and save. Color by depth (red=near, blue=far)."""
     img = raw_img.copy()
-    pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)
+    # Transform to camera frame once, then reuse for both depth filter and projection.
+    pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)  # (3, N)
     depth = pts_camera[2]
     in_front = (depth > 1.0) & (depth < 80.0)
     front_idx = np.where(in_front)[0]
@@ -115,7 +116,7 @@ def _save_lidar_projection_overlay(
         return
 
     projected = cam_calib_data.project_world_onto_camera(
-        pts_vehicle[front_idx].T, valid_points=False, return_transposed=False,
+        pts_camera[:, front_idx], valid_points=True, return_transposed=False, in_camera_frame=True,
     )
     px_u = projected[0].astype(np.int32)
     px_v = projected[1].astype(np.int32)

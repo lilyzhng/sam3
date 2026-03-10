@@ -105,56 +105,25 @@ def lift_detections_to_3d(
         pts_vehicle.shape[0],
     )
 
-    # Project vehicle-frame points into camera.
+    # Transform to camera frame once — reuse for depth filter and projection.
     pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)  # (3, N)
     depth = pts_camera[2]
-
-    n_in_range = int(((depth > min_depth) & (depth < max_depth)).sum())
-    _LOGGER.info(
-        "  Camera-frame depth: min=%.2f, max=%.2f, %d negative, "
-        "%d in [%.1f,%.1f], %d filtered out",
-        depth.min(), depth.max(),
-        int((depth <= 0).sum()),
-        n_in_range, min_depth, max_depth,
-        pts_vehicle.shape[0] - n_in_range,
-    )
-
     in_front = (depth > min_depth) & (depth < max_depth)
     front_idx = np.where(in_front)[0]
     if front_idx.size == 0:
         return []
 
-    # DEBUG: z-distribution of front-filtered points in vehicle frame.
-    front_z = pts_vehicle[front_idx, 2]
     _LOGGER.info(
-        "  Front-filtered: %d pts, z: min=%.2f, max=%.2f, "
-        "ground (z<-0.5): %d, high (z>0.5): %d",
-        front_idx.size, front_z.min(), front_z.max(),
-        int((front_z < -0.5).sum()), int((front_z > 0.5).sum()),
+        "  Depth filter: %d/%d pts in [%.1f, %.1f]m",
+        front_idx.size, pts_vehicle.shape[0], min_depth, max_depth,
     )
 
+    # Project camera-frame points directly — no redundant vehicle→camera transform.
     projected = cam_calib_data.project_world_onto_camera(
-        pts_vehicle[front_idx].T, valid_points=False, return_transposed=False,
+        pts_camera[:, front_idx], valid_points=True, return_transposed=False, in_camera_frame=True,
     )
     pixel_u_native = projected[0]
     pixel_v_native = projected[1]
-
-    # DEBUG: Check projection output for ground-level points specifically.
-    ground_mask = front_z < -0.5
-    if ground_mask.any():
-        ground_u = pixel_u_native[ground_mask]
-        ground_v = pixel_v_native[ground_mask]
-        _LOGGER.info(
-            "  Ground pts projection: %d pts, u=[%.0f,%.0f], v=[%.0f,%.0f], "
-            "nan_u=%d, nan_v=%d, inf_u=%d, inf_v=%d",
-            int(ground_mask.sum()),
-            np.nanmin(ground_u), np.nanmax(ground_u),
-            np.nanmin(ground_v), np.nanmax(ground_v),
-            int(np.isnan(ground_u).sum()), int(np.isnan(ground_v).sum()),
-            int(np.isinf(ground_u).sum()), int(np.isinf(ground_v).sum()),
-        )
-    else:
-        _LOGGER.info("  NO ground-level points (z<-0.5) in front-filtered set!")
 
     # Map native pixel coords → inference image coords.
     mask_u = (pixel_u_native - crop_xmin) * rescale_factor
