@@ -5,8 +5,8 @@ No RLE encoding, no bbox cropping, no downsampling — bypasses the perception
 team's compact pipeline entirely.
 
 Usage:
-   bazel run //autonomy/perception/labels/pseudo_lanelines:laneline_3d_visualizer -- \
-     -o /tmp/laneline_lift_viz -r 1 --max-frames 1
+   bazel run //autonomy/perception/labels/pseudo_lanelines:visualizer -- \
+     -o /tmp/laneline_lift_viz -r 1 --max-frames 3
 """
 
 
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Final
 
 import click
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -97,11 +98,43 @@ def _get_lidar_points(frame, calibrations, platform):
     return pts_vehicle, intensities
 
 
+def _save_lidar_projection_overlay(
+    raw_img: np.ndarray,
+    pts_vehicle: np.ndarray,
+    cam_calib_data: CameraCalibrationData,
+    save_path: Path,
+) -> None:
+    """Project LiDAR onto raw camera image and save. Color by depth (red=near, blue=far)."""
+    img = raw_img.copy()
+    pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)
+    depth = pts_camera[2]
+    in_front = (depth > 1.0) & (depth < 80.0)
+    front_idx = np.where(in_front)[0]
+    if front_idx.size == 0:
+        _LOGGER.warning("  No front-facing LiDAR pts for projection overlay.")
+        return
+
+    projected = cam_calib_data.project_world_onto_camera(
+        pts_vehicle[front_idx].T, valid_points=False, return_transposed=False,
+    )
+    px_u = projected[0].astype(np.int32)
+    px_v = projected[1].astype(np.int32)
+    img_h, img_w = img.shape[:2]
+    valid = (px_u >= 0) & (px_u < img_w) & (px_v >= 0) & (px_v < img_h)
+    vi = np.where(valid)[0]
+    for idx in vi:
+        d = depth[front_idx[idx]]
+        t = min(d / 80.0, 1.0)
+        color = (int(255 * (1 - t)), 0, int(255 * t))  # BGR: red→blue
+        cv2.circle(img, (px_u[idx], px_v[idx]), 2, color, -1)
+    cv2.imwrite(str(save_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    _LOGGER.info("  Saved LiDAR projection overlay (%d pts): %s", vi.size, save_path.name)
+
+
 @click.command()
 @click.option("-o", "--output-dir", type=Path, default="/tmp/laneline_lift_viz", help="Output directory.")
 @click.option("-r", "--rows", type=int, default=1, help="Number of rows to process.")
-@click.option("--max-frames", type=int, default=1, help="Max frames to process per row (-1 = all).")
-@click.option("--start-frame", type=int, default=0, help="Frame index to start processing from.")
+@click.option("--max-frames", type=int, default=-1, help="Max frames with LiDAR to process per row (-1 = all).")
 @click.option("--confidence", type=float, default=0.6, help="SAM3 confidence threshold.")
 @click.option(
     "--debug-projection",
@@ -115,7 +148,7 @@ def _get_lidar_points(frame, calibrations, platform):
     default=False,
     help="Render detection labels as a legend in the top-right corner of debug images.",
 )
-def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confidence: float, debug_projection: bool, legend_mode: bool) -> None:
+def main(output_dir: Path, rows: int, max_frames: int, confidence: float, debug_projection: bool, legend_mode: bool) -> None:
     """Run SAM3 lane-line inference → LiDAR 3D lifting → save BEV visualizations."""
     check_credentials()
 
@@ -147,9 +180,8 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
     if not debug_projection:
         sam_autolabeler = create_sam_autolabeler(autolabeler_config, lakefs)
 
-    # Hydrators: images for SAM3, LiDAR for lifting.
-    image_hydrator = HydrationTransformationV2(process_images=True, process_radar=False, process_lidar=False)
-    lidar_hydrator = HydrationTransformationV2(process_images=False, process_radar=False, process_lidar=True)
+    # Single hydrator for both images and LiDAR — keeps sequential state in sync.
+    hydrator = HydrationTransformationV2(process_images=True, process_radar=False, process_lidar=True)
 
     num_rows_processed = 0
     for file_reference in references:
@@ -177,47 +209,32 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                 input_row.identifiers, "platform", None,
             )
 
-            all_frames = input_row.frames
-            end_frame = start_frame + max_frames if max_frames >= 0 else len(all_frames)
-            end_frame = min(end_frame, len(all_frames))
+            # Process ALL frames sequentially — no sampling, no skipping.
+            # The hydrator expects sequential calls; skipping frames causes
+            # LiDAR/camera mismatch.
+            frames_processed = 0
+            for frame_idx, frame in enumerate(input_row.frames):
+                if max_frames >= 0 and frames_processed >= max_frames:
+                    break
 
-            # Hydrate LiDAR sequentially up to the last frame we need.
-            # The hydrator expects sequential calls, so we can't skip frames.
-            # LiDAR hydration is cheap (just loading point clouds); SAM3 is the
-            # expensive part and only runs on selected frames.
-            _LOGGER.info(
-                "Hydrating LiDAR for frames 0-%d (processing frames %d-%d)...",
-                end_frame - 1, start_frame, end_frame - 1,
-            )
-            for i in range(end_frame):
-                frame = all_frames[i]
+                frame_id = getattr(frame, "frame_id", None)
+
+                # Hydrate LiDAR.
                 if hasattr(frame, "lidars") and frame.lidars:
                     for lidar_obs in frame.lidars:
                         try:
-                            lidar_hydrator(lidar_obs)
+                            hydrator(lidar_obs)
                         except Exception as e:
-                            _LOGGER.warning(
-                                "Failed to hydrate LiDAR '%s' (frame %d): %s",
-                                getattr(lidar_obs, "sensor_name", "unknown"), i, e,
-                            )
-
-            # Only run SAM3 + lifting on the selected frame range.
-            frames = all_frames[start_frame:end_frame]
-            _LOGGER.info("Running inference on %d frame(s) [%d:%d].", len(frames), start_frame, end_frame)
-
-            for frame_idx, frame in enumerate(frames):
-                abs_frame_idx = start_frame + frame_idx
-                frame_id = getattr(frame, "frame_id", None)
-                _LOGGER.info("  Frame %d (abs %d): frame_id=%s", frame_idx, abs_frame_idx, frame_id)
+                            _LOGGER.warning("Failed to hydrate LiDAR (frame %d): %s", frame_idx, e)
 
                 pts_vehicle, intensities = _get_lidar_points(frame, calibrations, platform)
                 if pts_vehicle is None:
-                    _LOGGER.warning("  Frame %d: no LiDAR data, skipping.", frame_idx)
+                    _LOGGER.info("  Frame %d: no LiDAR, skipping.", frame_idx)
                     continue
 
-                _LOGGER.info("  Frame %d: %d LiDAR points in vehicle frame.", frame_idx, pts_vehicle.shape[0])
+                _LOGGER.info("  Frame %d (id=%s): %d LiDAR pts.", frame_idx, frame_id, pts_vehicle.shape[0])
 
-                # Run SAM3 on each camera and lift to 3D.
+                # Process cameras.
                 all_frame_results = []
                 if frame.cameras is None:
                     continue
@@ -230,7 +247,7 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
 
                     # Hydrate image.
                     try:
-                        image_hydrator(camera)
+                        hydrator(camera)
                     except Exception as e:
                         _LOGGER.warning("Failed to hydrate camera '%s': %s", camera.sensor_name, e)
                         continue
@@ -238,7 +255,7 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                     if camera.image.data is None:
                         continue
 
-                    # Get camera calibration for projection.
+                    # Get camera calibration.
                     cam_calib_data = None
                     for cam_calib in calibrations.cameras:
                         if cam_calib.sensor_name == camera.sensor_name:
@@ -249,43 +266,15 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                         camera.image.data = None
                         continue
 
+                    # Always save LiDAR projection overlay for debugging.
+                    proj_path = output_dir / f"{input_row.row_id}_{frame_id}_{camera.sensor_name}_lidar_proj.jpg"
+                    _save_lidar_projection_overlay(camera.image.data, pts_vehicle, cam_calib_data, proj_path)
+
                     if debug_projection:
-                        # Skip SAM3 — just project LiDAR onto the raw camera image.
-                        import cv2
-                        raw_img = camera.image.data.copy()
-                        # Project LiDAR into camera.
-                        pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)
-                        depth = pts_camera[2]
-                        in_front = (depth > 1.0) & (depth < 80.0)
-                        front_idx = np.where(in_front)[0]
-                        if front_idx.size > 0:
-                            projected = cam_calib_data.project_world_onto_camera(
-                                pts_vehicle[front_idx].T, valid_points=False, return_transposed=False,
-                            )
-                            px_u = projected[0].astype(np.int32)
-                            px_v = projected[1].astype(np.int32)
-                            img_h, img_w = raw_img.shape[:2]
-                            valid = (px_u >= 0) & (px_u < img_w) & (px_v >= 0) & (px_v < img_h)
-                            vi = np.where(valid)[0]
-                            # Color by depth: near=red, far=blue.
-                            for idx in vi:
-                                d = depth[front_idx[idx]]
-                                t = min(d / 80.0, 1.0)
-                                color = (int(255 * (1 - t)), 0, int(255 * t))  # BGR: red→blue
-                                cv2.circle(raw_img, (px_u[idx], px_v[idx]), 2, color, -1)
-                            _LOGGER.info(
-                                "  Camera '%s': %d LiDAR pts projected, %d in image bounds",
-                                camera.sensor_name, front_idx.size, vi.size,
-                            )
-                        else:
-                            _LOGGER.warning("  Camera '%s': no front-facing LiDAR pts", camera.sensor_name)
-                        proj_name = f"{input_row.row_id}_{frame_id}_{camera.sensor_name}_lidar_proj.jpg"
-                        cv2.imwrite(str(output_dir / proj_name), cv2.cvtColor(raw_img, cv2.COLOR_RGB2BGR))
-                        _LOGGER.info("  Saved projection overlay: %s", proj_name)
                         camera.image.data = None
                         continue
 
-                    # Crop + resize — same preprocessing as transform_pad.py lines 123-127.
+                    # Crop + resize — same preprocessing as transform_pad.py.
                     image = Image.fromarray(
                         camera.image.data[
                             cam_proc.crop_ymin:cam_proc.crop_ymax,
@@ -293,17 +282,14 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                         ]
                     ).resize((cam_proc.input_image_width, cam_proc.input_image_height))
 
-                    # Run SAM3 — get full masks directly.
+                    # Run SAM3.
                     try:
                         detections = sam_autolabeler([image])[0]
                     except Exception as e:
                         _LOGGER.warning("SAM3 failed on camera '%s': %s", camera.sensor_name, e)
                         detections = []
 
-                    _LOGGER.info(
-                        "  Camera '%s': %d SAM3 detections",
-                        camera.sensor_name, len(detections),
-                    )
+                    _LOGGER.info("  Camera '%s': %d SAM3 detections", camera.sensor_name, len(detections))
 
                     if not detections:
                         camera.image.data = None
@@ -320,7 +306,7 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                             legend_mode=legend_mode,
                         )
 
-                    # Lift to 3D — direct mask lookup, no RLE.
+                    # Lift to 3D.
                     lift_debug_name = f"{input_row.row_id}_{frame_id}_{camera.sensor_name}"
                     results = lift_detections_to_3d(
                         pts_vehicle=pts_vehicle,
@@ -335,17 +321,16 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                         debug_name=lift_debug_name,
                     )
                     all_frame_results.extend(results)
-
-                    # Free image memory.
                     camera.image.data = None
 
                 if debug_projection:
+                    frames_processed += 1
                     continue
 
                 total_pts = sum(lp.num_points for lp in all_frame_results)
                 _LOGGER.info("  Frame %d: %d lane types, %d lane points.", frame_idx, len(all_frame_results), total_pts)
 
-                # Find SAM debug image for side-by-side viz.
+                # Side-by-side visualization.
                 sam_debug_path = None
                 if frame_id:
                     for cam_name in laneline_config.default_camera_names:
@@ -363,6 +348,8 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                         save_visualization(all_frame_results, viz_path)
                 else:
                     _LOGGER.warning("  No lane points found, skipping visualization.")
+
+                frames_processed += 1
 
             num_rows_processed += 1
 
