@@ -25,7 +25,7 @@ from autonomy.perception.datasets.auto_high_beam.constants import P758_LOG_FILTE
 from autonomy.perception.datasets.semantic_segmentation.sam_autolabeled.config import SemanticSegmentationDagsterConfig
 from autonomy.perception.datasets.semantic_segmentation.sam_autolabeled.transforms import create_sam_autolabeler
 from autonomy.perception.datasets.unified.gold import data_model as gold
-from autonomy.perception.datasets.unified_model_interface.data_model import get_point_cloud_data
+from autonomy.perception.datasets.unified_model_interface.data_model import get_data_xyz_m, get_point_cloud_data
 from autonomy.perception.labels.pseudo_lanelines.lanelines_config import (
     LaneLabelingSAM3Config,
     build_laneline_autolabeling_config,
@@ -81,21 +81,35 @@ def _get_lidar_points(frame, calibrations, platform):
     if center_lidar is None:
         return None, None, None
 
-    # Get point cloud data.
-    pts_raw = None
+    # Get point cloud data in vehicle frame using get_data_xyz_m (matches insertion.py).
+    # get_data_xyz_m returns (3, N) already in vehicle frame — no manual lidar→vehicle needed.
+    pts_xyz = None
     try:
-        pts_raw = get_point_cloud_data(center_lidar)
-    except (ValueError, AttributeError):
+        pts_xyz = get_data_xyz_m(center_lidar)  # (3, N) in vehicle frame
+    except (ValueError, AttributeError, KeyError):
         pass
-    if pts_raw is None and hasattr(center_lidar, "point_cloud") and center_lidar.point_cloud is not None:
-        pts_raw = getattr(center_lidar.point_cloud, "data", None)
-    if pts_raw is None:
-        return None, None, None
 
-    pts_raw = _ensure_2d_point_cloud(pts_raw)
-    vehicle_se3_lidar = SE3.from_pose(lidar_calib.vehicle_se3_sensor)
-    pts_vehicle = _transform_lidar_to_vehicle(pts_raw, vehicle_se3_lidar)
-    intensities = pts_raw[:, 3].astype(np.float32) if pts_raw.shape[1] > 3 else np.zeros(pts_raw.shape[0], dtype=np.float32)
+    if pts_xyz is None:
+        # Fallback: try get_point_cloud_data + manual transform.
+        pts_raw = None
+        try:
+            pts_raw = get_point_cloud_data(center_lidar)
+        except (ValueError, AttributeError):
+            pass
+        if pts_raw is None and hasattr(center_lidar, "point_cloud") and center_lidar.point_cloud is not None:
+            pts_raw = getattr(center_lidar.point_cloud, "data", None)
+        if pts_raw is None:
+            return None, None, None
+
+        pts_raw = _ensure_2d_point_cloud(pts_raw)
+        vehicle_se3_lidar = SE3.from_pose(lidar_calib.vehicle_se3_sensor)
+        pts_vehicle = _transform_lidar_to_vehicle(pts_raw, vehicle_se3_lidar)
+        intensities = pts_raw[:, 3].astype(np.float32) if pts_raw.shape[1] > 3 else np.zeros(pts_raw.shape[0], dtype=np.float32)
+        _LOGGER.warning("  Used get_point_cloud_data fallback (manual lidar→vehicle transform).")
+    else:
+        pts_vehicle = pts_xyz.T.astype(np.float64)  # (N, 3)
+        intensities = np.zeros(pts_vehicle.shape[0], dtype=np.float32)
+        _LOGGER.info("  Used get_data_xyz_m — points already in vehicle frame.")
 
     # Get LiDAR ego pose for ego-motion compensation.
     lidar_map_pose = getattr(center_lidar, "map_aligned_pose", None)
