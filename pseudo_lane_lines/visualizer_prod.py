@@ -180,10 +180,9 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, debug_
     if not debug_projection:
         sam_autolabeler = create_sam_autolabeler(autolabeler_config, lakefs)
 
-    # Only hydrate images — LiDAR data is already embedded in the parquet
-    # and read directly by get_point_cloud_data(). Hydrating LiDAR overwrites
-    # it with wrong data from a different source.
-    hydrator = HydrationTransformationV2(process_images=True, process_radar=False, process_lidar=False)
+    # Single hydrator for both images and LiDAR — they must be hydrated
+    # together to stay in sync. Separate hydrators cause mismatches.
+    hydrator = HydrationTransformationV2(process_images=True, process_radar=False, process_lidar=True)
 
     num_rows_processed = 0
     for file_reference in references:
@@ -221,7 +220,14 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, debug_
 
                 frame_id = getattr(frame, "frame_id", None)
 
-                # LiDAR data is already in the parquet — no hydration needed.
+                # Hydrate LiDAR through the same hydrator as images.
+                if hasattr(frame, "lidars") and frame.lidars:
+                    for lidar_obs in frame.lidars:
+                        try:
+                            hydrator(lidar_obs)
+                        except Exception as e:
+                            _LOGGER.warning("Failed to hydrate LiDAR (frame %d): %s", frame_idx, e)
+
                 pts_vehicle, intensities = _get_lidar_points(frame, calibrations, platform)
                 if pts_vehicle is None:
                     _LOGGER.info("  Frame %d: no LiDAR, skipping.", frame_idx)
