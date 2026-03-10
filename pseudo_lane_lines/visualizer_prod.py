@@ -11,7 +11,6 @@ Usage:
 
 
 import logging
-import random
 from datetime import datetime
 from pathlib import Path
 from typing import Final
@@ -53,22 +52,6 @@ from platforms.lakefs.client import LakeFS
 
 
 _LOGGER: Final = logging.getLogger(__name__)
-
-#: Fixed seed for reproducible frame subsampling (matches transform_pad.py).
-_SUBSAMPLE_SEED: Final = 42
-
-
-def _subsample_frames(frames: list, max_frames: int) -> list:
-    """Randomly subsample frames, preserving temporal order.
-
-    Uses the same seed and logic as transform_pad.py's subsample_sequence()
-    so the same frames are selected.
-    """
-    if max_frames < 0 or len(frames) <= max_frames:
-        return frames
-    indices = sorted(random.Random(_SUBSAMPLE_SEED).sample(range(len(frames)), max_frames))
-    _LOGGER.info("Subsampled to %d frame(s): indices=%s", len(indices), indices)
-    return [frames[i] for i in indices]
 
 
 def _get_lidar_points(frame, calibrations, platform):
@@ -117,21 +100,16 @@ def _get_lidar_points(frame, calibrations, platform):
 @click.command()
 @click.option("-o", "--output-dir", type=Path, default="/tmp/laneline_lift_viz", help="Output directory.")
 @click.option("-r", "--rows", type=int, default=1, help="Number of rows to process.")
-@click.option("--max-frames", type=int, default=1, help="Max frames per row (-1 = all).")
+@click.option("--max-frames", type=int, default=1, help="Max frames to process per row (-1 = all).")
+@click.option("--start-frame", type=int, default=0, help="Frame index to start processing from.")
 @click.option("--confidence", type=float, default=0.6, help="SAM3 confidence threshold.")
-@click.option(
-    "--no-subsample",
-    is_flag=True,
-    default=False,
-    help="Use sequential frames instead of random subsampling (debug).",
-)
 @click.option(
     "--legend-mode",
     is_flag=True,
     default=False,
     help="Render detection labels as a legend in the top-right corner of debug images.",
 )
-def main(output_dir: Path, rows: int, max_frames: int, confidence: float, no_subsample: bool, legend_mode: bool) -> None:
+def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confidence: float, legend_mode: bool) -> None:
     """Run SAM3 lane-line inference → LiDAR 3D lifting → save BEV visualizations."""
     check_credentials()
 
@@ -191,40 +169,37 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, no_sub
                 input_row.identifiers, "platform", None,
             )
 
-            if no_subsample:
-                frames = input_row.frames[:max_frames] if max_frames >= 0 else input_row.frames
-                _LOGGER.info("Sequential frames: %d (no subsampling)", len(frames))
-            else:
-                frames = _subsample_frames(input_row.frames, max_frames)
+            all_frames = input_row.frames
+            end_frame = start_frame + max_frames if max_frames >= 0 else len(all_frames)
+            end_frame = min(end_frame, len(all_frames))
 
-            for frame_idx, frame in enumerate(frames):
-                frame_id = getattr(frame, "frame_id", None)
-                frame_ts = getattr(frame, "timestamp", None)
-                _LOGGER.info(
-                    "  Frame %d: frame_id=%s, timestamp=%s",
-                    frame_idx, frame_id, frame_ts,
-                )
-
-                # Log LiDAR sensor info before hydration.
+            # Hydrate ALL frames' LiDAR sequentially (cheap) so the hydrator
+            # reads files in order. This prevents the mismatch that occurs when
+            # skipping frames — the hydrator loads data sequentially regardless
+            # of which frame object you pass.
+            _LOGGER.info(
+                "Hydrating LiDAR for all %d frames (processing frames %d-%d)...",
+                len(all_frames), start_frame, end_frame - 1,
+            )
+            for frame in all_frames:
                 if hasattr(frame, "lidars") and frame.lidars:
                     for lidar_obs in frame.lidars:
-                        lidar_ts = getattr(lidar_obs, "timestamp", None)
-                        lidar_name = getattr(lidar_obs, "sensor_name", "unknown")
-                        _LOGGER.info(
-                            "    LiDAR '%s': timestamp=%s", lidar_name, lidar_ts,
-                        )
                         try:
                             lidar_hydrator(lidar_obs)
                         except Exception as e:
-                            _LOGGER.warning("Failed to hydrate LiDAR '%s': %s", lidar_name, e)
+                            _LOGGER.warning(
+                                "Failed to hydrate LiDAR '%s': %s",
+                                getattr(lidar_obs, "sensor_name", "unknown"), e,
+                            )
 
-                # Log camera sensor info.
-                if frame.cameras:
-                    for cam in frame.cameras:
-                        cam_ts = getattr(cam, "timestamp", None)
-                        _LOGGER.info(
-                            "    Camera '%s': timestamp=%s", cam.sensor_name, cam_ts,
-                        )
+            # Only run SAM3 + lifting on the selected frame range.
+            frames = all_frames[start_frame:end_frame]
+            _LOGGER.info("Running inference on %d frame(s) [%d:%d].", len(frames), start_frame, end_frame)
+
+            for frame_idx, frame in enumerate(frames):
+                abs_frame_idx = start_frame + frame_idx
+                frame_id = getattr(frame, "frame_id", None)
+                _LOGGER.info("  Frame %d (abs %d): frame_id=%s", frame_idx, abs_frame_idx, frame_id)
 
                 pts_vehicle, intensities = _get_lidar_points(frame, calibrations, platform)
                 if pts_vehicle is None:
