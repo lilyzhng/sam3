@@ -120,12 +120,18 @@ def _get_lidar_points(frame, calibrations, platform):
 @click.option("--max-frames", type=int, default=1, help="Max frames per row (-1 = all).")
 @click.option("--confidence", type=float, default=0.6, help="SAM3 confidence threshold.")
 @click.option(
+    "--no-subsample",
+    is_flag=True,
+    default=False,
+    help="Use sequential frames instead of random subsampling (debug).",
+)
+@click.option(
     "--legend-mode",
     is_flag=True,
     default=False,
     help="Render detection labels as a legend in the top-right corner of debug images.",
 )
-def main(output_dir: Path, rows: int, max_frames: int, confidence: float, legend_mode: bool) -> None:
+def main(output_dir: Path, rows: int, max_frames: int, confidence: float, no_subsample: bool, legend_mode: bool) -> None:
     """Run SAM3 lane-line inference → LiDAR 3D lifting → save BEV visualizations."""
     check_credentials()
 
@@ -185,18 +191,40 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, legend
                 input_row.identifiers, "platform", None,
             )
 
-            frames = _subsample_frames(input_row.frames, max_frames)
+            if no_subsample:
+                frames = input_row.frames[:max_frames] if max_frames >= 0 else input_row.frames
+                _LOGGER.info("Sequential frames: %d (no subsampling)", len(frames))
+            else:
+                frames = _subsample_frames(input_row.frames, max_frames)
 
             for frame_idx, frame in enumerate(frames):
                 frame_id = getattr(frame, "frame_id", None)
+                frame_ts = getattr(frame, "timestamp", None)
+                _LOGGER.info(
+                    "  Frame %d: frame_id=%s, timestamp=%s",
+                    frame_idx, frame_id, frame_ts,
+                )
 
-                # Hydrate LiDAR.
+                # Log LiDAR sensor info before hydration.
                 if hasattr(frame, "lidars") and frame.lidars:
                     for lidar_obs in frame.lidars:
+                        lidar_ts = getattr(lidar_obs, "timestamp", None)
+                        lidar_name = getattr(lidar_obs, "sensor_name", "unknown")
+                        _LOGGER.info(
+                            "    LiDAR '%s': timestamp=%s", lidar_name, lidar_ts,
+                        )
                         try:
                             lidar_hydrator(lidar_obs)
                         except Exception as e:
-                            _LOGGER.warning("Failed to hydrate LiDAR '%s': %s", getattr(lidar_obs, "sensor_name", "unknown"), e)
+                            _LOGGER.warning("Failed to hydrate LiDAR '%s': %s", lidar_name, e)
+
+                # Log camera sensor info.
+                if frame.cameras:
+                    for cam in frame.cameras:
+                        cam_ts = getattr(cam, "timestamp", None)
+                        _LOGGER.info(
+                            "    Camera '%s': timestamp=%s", cam.sensor_name, cam_ts,
+                        )
 
                 pts_vehicle, intensities = _get_lidar_points(frame, calibrations, platform)
                 if pts_vehicle is None:
@@ -273,6 +301,7 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, legend
                         continue
 
                     # Lift to 3D — direct mask lookup, no RLE.
+                    lift_debug_name = f"{input_row.row_id}_{frame_id}_{camera.sensor_name}"
                     results = lift_detections_to_3d(
                         pts_vehicle=pts_vehicle,
                         intensities=intensities,
@@ -283,6 +312,7 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, legend
                         rescale_factor=cam_proc.input_image_rescale_factor,
                         lane_classes=laneline_config.lane_classes,
                         min_score=laneline_config.confidence_threshold,
+                        debug_name=lift_debug_name,
                     )
                     all_frame_results.extend(results)
 

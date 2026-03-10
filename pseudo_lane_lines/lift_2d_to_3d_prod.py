@@ -53,6 +53,7 @@ def lift_detections_to_3d(
     min_score: float,
     min_depth: float = _MIN_DEPTH_M,
     max_depth: float = _MAX_DEPTH_M,
+    debug_name: str | None = None,
 ) -> list[LanePoints3D]:
     """Lift SAM3 full-image masks to 3D lane points via LiDAR projection.
 
@@ -92,13 +93,45 @@ def lift_detections_to_3d(
     if not lane_dets:
         return []
 
+    # DEBUG: Examine point cloud distribution in vehicle frame.
+    z_vehicle = pts_vehicle[:, 2]
+    _LOGGER.info(
+        "  Vehicle-frame z: min=%.2f, max=%.2f, mean=%.2f, "
+        "ground (z<-0.5): %d, mid (-0.5<z<0.5): %d, high (z>0.5): %d, total: %d",
+        z_vehicle.min(), z_vehicle.max(), z_vehicle.mean(),
+        int((z_vehicle < -0.5).sum()),
+        int(((z_vehicle >= -0.5) & (z_vehicle <= 0.5)).sum()),
+        int((z_vehicle > 0.5).sum()),
+        pts_vehicle.shape[0],
+    )
+
     # Project vehicle-frame points into camera.
     pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)  # (3, N)
     depth = pts_camera[2]
+
+    n_in_range = int(((depth > min_depth) & (depth < max_depth)).sum())
+    _LOGGER.info(
+        "  Camera-frame depth: min=%.2f, max=%.2f, %d negative, "
+        "%d in [%.1f,%.1f], %d filtered out",
+        depth.min(), depth.max(),
+        int((depth <= 0).sum()),
+        n_in_range, min_depth, max_depth,
+        pts_vehicle.shape[0] - n_in_range,
+    )
+
     in_front = (depth > min_depth) & (depth < max_depth)
     front_idx = np.where(in_front)[0]
     if front_idx.size == 0:
         return []
+
+    # DEBUG: z-distribution of front-filtered points in vehicle frame.
+    front_z = pts_vehicle[front_idx, 2]
+    _LOGGER.info(
+        "  Front-filtered: %d pts, z: min=%.2f, max=%.2f, "
+        "ground (z<-0.5): %d, high (z>0.5): %d",
+        front_idx.size, front_z.min(), front_z.max(),
+        int((front_z < -0.5).sum()), int((front_z > 0.5).sum()),
+    )
 
     projected = cam_calib_data.project_world_onto_camera(
         pts_vehicle[front_idx].T, valid_points=False, return_transposed=False,
@@ -106,47 +139,63 @@ def lift_detections_to_3d(
     pixel_u_native = projected[0]
     pixel_v_native = projected[1]
 
+    # DEBUG: Check projection output for ground-level points specifically.
+    ground_mask = front_z < -0.5
+    if ground_mask.any():
+        ground_u = pixel_u_native[ground_mask]
+        ground_v = pixel_v_native[ground_mask]
+        _LOGGER.info(
+            "  Ground pts projection: %d pts, u=[%.0f,%.0f], v=[%.0f,%.0f], "
+            "nan_u=%d, nan_v=%d, inf_u=%d, inf_v=%d",
+            int(ground_mask.sum()),
+            np.nanmin(ground_u), np.nanmax(ground_u),
+            np.nanmin(ground_v), np.nanmax(ground_v),
+            int(np.isnan(ground_u).sum()), int(np.isnan(ground_v).sum()),
+            int(np.isinf(ground_u).sum()), int(np.isinf(ground_v).sum()),
+        )
+    else:
+        _LOGGER.info("  NO ground-level points (z<-0.5) in front-filtered set!")
+
     # Map native pixel coords → inference image coords.
     mask_u = (pixel_u_native - crop_xmin) * rescale_factor
     mask_v = (pixel_v_native - crop_ymin) * rescale_factor
 
-    # DEBUG: save overlay of LiDAR projection on mask image.
-    import cv2
-    from pathlib import Path
-    debug_dir = Path("/tmp/laneline_lift_viz/debug")
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    for det_i, det in enumerate(detections):
-        if det.label.lower() not in lane_classes or det.score < min_score:
-            continue
-        mask = det.mask
-        # Create RGB overlay: mask in green, LiDAR points in red.
-        overlay = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
-        overlay[mask] = [0, 255, 0]  # Green = mask True pixels
-        # Plot ALL in-bounds LiDAR points in blue.
+    # DEBUG: save single combined overlay — all lane masks + LiDAR projection.
+    if debug_name and lane_dets:
+        import cv2
+        from pathlib import Path
+        debug_dir = Path("/tmp/laneline_lift_viz/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ref_mask = lane_dets[0].mask
+        overlay = np.zeros((ref_mask.shape[0], ref_mask.shape[1], 3), dtype=np.uint8)
+        # Paint each lane detection mask in green.
+        for det in lane_dets:
+            overlay[det.mask] = [0, 255, 0]
+            # Draw mask bbox in yellow.
+            true_rows = np.where(det.mask.any(axis=1))[0]
+            true_cols = np.where(det.mask.any(axis=0))[0]
+            if len(true_rows) > 0 and len(true_cols) > 0:
+                cv2.rectangle(
+                    overlay,
+                    (int(true_cols[0]), int(true_rows[0])),
+                    (int(true_cols[-1]), int(true_rows[-1])),
+                    (0, 255, 255), 1,
+                )
+        # Plot ALL in-bounds LiDAR points in red.
         in_bounds = (
-            (mask_u >= 0) & (mask_u < mask.shape[1])
-            & (mask_v >= 0) & (mask_v < mask.shape[0])
+            (mask_u >= 0) & (mask_u < ref_mask.shape[1])
+            & (mask_v >= 0) & (mask_v < ref_mask.shape[0])
         )
         bl = np.where(in_bounds)[0]
         if bl.size > 0:
             u_pts = mask_u[bl].astype(np.int32)
             v_pts = mask_v[bl].astype(np.int32)
-            np.clip(u_pts, 0, mask.shape[1] - 1, out=u_pts)
-            np.clip(v_pts, 0, mask.shape[0] - 1, out=v_pts)
-            overlay[v_pts, u_pts] = [0, 0, 255]  # Red = LiDAR (BGR)
-        # Draw True bbox in yellow.
-        true_rows = np.where(mask.any(axis=1))[0]
-        true_cols = np.where(mask.any(axis=0))[0]
-        if len(true_rows) > 0 and len(true_cols) > 0:
-            cv2.rectangle(
-                overlay,
-                (int(true_cols[0]), int(true_rows[0])),
-                (int(true_cols[-1]), int(true_rows[-1])),
-                (0, 255, 255), 1,
-            )
-        fname = debug_dir / f"overlay_det{det_i}_{det.label.replace(' ', '_')}.png"
+            np.clip(u_pts, 0, ref_mask.shape[1] - 1, out=u_pts)
+            np.clip(v_pts, 0, ref_mask.shape[0] - 1, out=v_pts)
+            overlay[v_pts, u_pts] = [0, 0, 255]
+        fname = debug_dir / f"{debug_name}_lidar_overlay.png"
         cv2.imwrite(str(fname), overlay)
-        _LOGGER.info("  DEBUG: saved overlay to %s", fname)
+        _LOGGER.info("  DEBUG: saved combined overlay to %s", fname)
 
     _LOGGER.info(
         "  Projection: %d front pts, native u=[%.0f,%.0f] v=[%.0f,%.0f], "
