@@ -110,17 +110,43 @@ def lift_detections_to_3d(
     mask_u = (pixel_u_native - crop_xmin) * rescale_factor
     mask_v = (pixel_v_native - crop_ymin) * rescale_factor
 
-    # DEBUG: distribution of LiDAR in mask-v bands.
-    for v_thresh in [200, 250, 280, 300]:
-        high_v = mask_v >= v_thresh
-        if high_v.any():
-            high_u = mask_u[high_v]
-            _LOGGER.info(
-                "  DEBUG v>=%d: %d pts, u range=[%.0f,%.0f]",
-                v_thresh, int(high_v.sum()), high_u.min(), high_u.max(),
+    # DEBUG: save overlay of LiDAR projection on mask image.
+    import cv2
+    from pathlib import Path
+    debug_dir = Path("/tmp/laneline_lift_viz/debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    for det_i, det in enumerate(detections):
+        if det.label.lower() not in lane_classes or det.score < min_score:
+            continue
+        mask = det.mask
+        # Create RGB overlay: mask in green, LiDAR points in red.
+        overlay = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+        overlay[mask] = [0, 255, 0]  # Green = mask True pixels
+        # Plot ALL in-bounds LiDAR points in blue.
+        in_bounds = (
+            (mask_u >= 0) & (mask_u < mask.shape[1])
+            & (mask_v >= 0) & (mask_v < mask.shape[0])
+        )
+        bl = np.where(in_bounds)[0]
+        if bl.size > 0:
+            u_pts = mask_u[bl].astype(np.int32)
+            v_pts = mask_v[bl].astype(np.int32)
+            np.clip(u_pts, 0, mask.shape[1] - 1, out=u_pts)
+            np.clip(v_pts, 0, mask.shape[0] - 1, out=v_pts)
+            overlay[v_pts, u_pts] = [0, 0, 255]  # Red = LiDAR (BGR)
+        # Draw True bbox in yellow.
+        true_rows = np.where(mask.any(axis=1))[0]
+        true_cols = np.where(mask.any(axis=0))[0]
+        if len(true_rows) > 0 and len(true_cols) > 0:
+            cv2.rectangle(
+                overlay,
+                (int(true_cols[0]), int(true_rows[0])),
+                (int(true_cols[-1]), int(true_rows[-1])),
+                (0, 255, 255), 1,
             )
-        else:
-            _LOGGER.info("  DEBUG v>=%d: 0 pts", v_thresh)
+        fname = debug_dir / f"overlay_det{det_i}_{det.label.replace(' ', '_')}.png"
+        cv2.imwrite(str(fname), overlay)
+        _LOGGER.info("  DEBUG: saved overlay to %s", fname)
 
     _LOGGER.info(
         "  Projection: %d front pts, native u=[%.0f,%.0f] v=[%.0f,%.0f], "
