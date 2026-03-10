@@ -56,14 +56,15 @@ _LOGGER: Final = logging.getLogger(__name__)
 
 
 def _get_lidar_points(frame, calibrations, platform):
-    """Extract LiDAR points in vehicle frame + intensities from a frame.
+    """Extract LiDAR points in vehicle frame + intensities + ego pose from a frame.
 
     Returns:
-        (pts_vehicle, intensities) or (None, None) if LiDAR unavailable.
+        (pts_vehicle, intensities, lidar_map_pose) or (None, None, None) if LiDAR unavailable.
+        lidar_map_pose is the LiDAR's map_aligned_pose (Pose), needed for ego-motion compensation.
     """
     frame_lidars = getattr(frame, "lidars", None)
     if not frame_lidars:
-        return None, None
+        return None, None, None
 
     lidar_calib = calibrations.get_center_lidar(platform)
     center_lidar = None
@@ -78,7 +79,7 @@ def _get_lidar_points(frame, calibrations, platform):
         center_lidar = frame_lidars[0]
 
     if center_lidar is None:
-        return None, None
+        return None, None, None
 
     # Get point cloud data.
     pts_raw = None
@@ -89,13 +90,44 @@ def _get_lidar_points(frame, calibrations, platform):
     if pts_raw is None and hasattr(center_lidar, "point_cloud") and center_lidar.point_cloud is not None:
         pts_raw = getattr(center_lidar.point_cloud, "data", None)
     if pts_raw is None:
-        return None, None
+        return None, None, None
 
     pts_raw = _ensure_2d_point_cloud(pts_raw)
     vehicle_se3_lidar = SE3.from_pose(lidar_calib.vehicle_se3_sensor)
     pts_vehicle = _transform_lidar_to_vehicle(pts_raw, vehicle_se3_lidar)
     intensities = pts_raw[:, 3].astype(np.float32) if pts_raw.shape[1] > 3 else np.zeros(pts_raw.shape[0], dtype=np.float32)
-    return pts_vehicle, intensities
+
+    # Get LiDAR ego pose for ego-motion compensation.
+    lidar_map_pose = getattr(center_lidar, "map_aligned_pose", None)
+
+    return pts_vehicle, intensities, lidar_map_pose
+
+
+def _build_lidar_to_camera_transform(
+    lidar_map_pose,
+    camera_map_pose,
+    cam_calib_data: CameraCalibrationData,
+) -> SE3:
+    """Build ego-motion-compensated transform: LiDAR vehicle frame → camera frame.
+
+    Matches the transform chain from insertion.py _plot_lidar_points():
+        1. LiDAR vehicle → map (lidar_map_pose)
+        2. map → camera vehicle (inverse of camera_map_pose)
+        3. camera vehicle → camera sensor (inverse of vehicle_se3_sensor)
+
+    Args:
+        lidar_map_pose: LiDAR's map_aligned_pose (vehicle → map at LiDAR capture time).
+        camera_map_pose: Camera's vehicle_se3_map (vehicle → map at camera capture time).
+        cam_calib_data: Camera calibration with vehicle_se3_sensor extrinsics.
+
+    Returns:
+        SE3 transform that maps points from LiDAR vehicle frame to camera frame.
+    """
+    lidar_map_se3_vehicle = SE3.from_pose(lidar_map_pose)
+    camera_vehicle_se3_map = SE3.from_pose(camera_map_pose).inverse()
+    lidar_vehicle_se3_vehicle = camera_vehicle_se3_map.compose(lidar_map_se3_vehicle)
+    lidar_camera_se3_vehicle = cam_calib_data.vehicle_se3_sensor.inverse().compose(lidar_vehicle_se3_vehicle)
+    return lidar_camera_se3_vehicle
 
 
 def _save_lidar_projection_overlay(
@@ -103,11 +135,24 @@ def _save_lidar_projection_overlay(
     pts_vehicle: np.ndarray,
     cam_calib_data: CameraCalibrationData,
     save_path: Path,
+    lidar_map_pose=None,
+    camera_map_pose=None,
 ) -> None:
-    """Project LiDAR onto raw camera image and save. Color by depth (red=near, blue=far)."""
+    """Project LiDAR onto raw camera image and save. Color by depth (red=near, blue=far).
+
+    Uses ego-motion compensation when lidar_map_pose and camera_map_pose are available,
+    matching the transform chain from insertion.py.
+    """
     img = raw_img.copy()
-    # Transform to camera frame once, then reuse for both depth filter and projection.
-    pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)  # (3, N)
+
+    # Build transform: LiDAR vehicle frame → camera frame.
+    if lidar_map_pose is not None and camera_map_pose is not None:
+        lidar_to_camera = _build_lidar_to_camera_transform(lidar_map_pose, camera_map_pose, cam_calib_data)
+        pts_camera = lidar_to_camera.apply(pts_vehicle.T)  # (3, N)
+    else:
+        _LOGGER.warning("  No ego poses available — projecting without ego-motion compensation.")
+        pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)  # (3, N)
+
     depth = pts_camera[2]
     in_front = (depth > 1.0) & (depth < 80.0)
     front_idx = np.where(in_front)[0]
@@ -232,12 +277,14 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, debug_
                         except Exception as e:
                             _LOGGER.warning("Failed to hydrate LiDAR (frame %d): %s", frame_idx, e)
 
-                pts_vehicle, intensities = _get_lidar_points(frame, calibrations, platform)
+                pts_vehicle, intensities, lidar_map_pose = _get_lidar_points(frame, calibrations, platform)
                 if pts_vehicle is None:
                     _LOGGER.info("  Frame %d: no LiDAR, skipping.", frame_idx)
                     continue
 
                 _LOGGER.info("  Frame %d (id=%s): %d LiDAR pts.", frame_idx, frame_id, pts_vehicle.shape[0])
+                if lidar_map_pose is None:
+                    _LOGGER.warning("  Frame %d: no LiDAR map_aligned_pose — ego-motion compensation disabled.", frame_idx)
 
                 # Process cameras.
                 all_frame_results = []
@@ -272,8 +319,14 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, debug_
                         continue
 
                     # Always save LiDAR projection overlay for debugging.
+                    # Use ego-motion compensation: LiDAR and camera have different ego poses.
+                    camera_map_pose = getattr(camera, "vehicle_se3_map", None)
                     proj_path = output_dir / f"{input_row.row_id}_{frame_id}_{camera.sensor_name}_lidar_proj.jpg"
-                    _save_lidar_projection_overlay(camera.image.data, pts_vehicle, cam_calib_data, proj_path)
+                    _save_lidar_projection_overlay(
+                        camera.image.data, pts_vehicle, cam_calib_data, proj_path,
+                        lidar_map_pose=lidar_map_pose,
+                        camera_map_pose=camera_map_pose,
+                    )
 
                     if debug_projection:
                         camera.image.data = None
@@ -324,6 +377,8 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, debug_
                         lane_classes=laneline_config.lane_classes,
                         min_score=laneline_config.confidence_threshold,
                         debug_name=lift_debug_name,
+                        lidar_map_pose=lidar_map_pose,
+                        camera_map_pose=camera_map_pose,
                     )
                     all_frame_results.extend(results)
                     camera.image.data = None

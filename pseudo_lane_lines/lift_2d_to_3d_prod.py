@@ -41,6 +41,33 @@ def _transform_lidar_to_vehicle(
     return pts_vehicle
 
 
+def _build_lidar_to_camera_transform(
+    lidar_map_pose,
+    camera_map_pose,
+    cam_calib_data: CameraCalibrationData,
+) -> SE3:
+    """Build ego-motion-compensated transform: LiDAR vehicle frame → camera frame.
+
+    Matches the transform chain from insertion.py _plot_lidar_points():
+        1. LiDAR vehicle → map (lidar_map_pose)
+        2. map → camera vehicle (inverse of camera_map_pose)
+        3. camera vehicle → camera sensor (inverse of vehicle_se3_sensor)
+
+    Args:
+        lidar_map_pose: LiDAR's map_aligned_pose (vehicle → map at LiDAR capture time).
+        camera_map_pose: Camera's vehicle_se3_map (vehicle → map at camera capture time).
+        cam_calib_data: Camera calibration with vehicle_se3_sensor extrinsics.
+
+    Returns:
+        SE3 transform that maps points from LiDAR vehicle frame to camera frame.
+    """
+    lidar_map_se3_vehicle = SE3.from_pose(lidar_map_pose)
+    camera_vehicle_se3_map = SE3.from_pose(camera_map_pose).inverse()
+    lidar_vehicle_se3_vehicle = camera_vehicle_se3_map.compose(lidar_map_se3_vehicle)
+    lidar_camera_se3_vehicle = cam_calib_data.vehicle_se3_sensor.inverse().compose(lidar_vehicle_se3_vehicle)
+    return lidar_camera_se3_vehicle
+
+
 def lift_detections_to_3d(
     pts_vehicle: npt.NDArray[np.float64],
     intensities: npt.NDArray[np.float32],
@@ -54,6 +81,8 @@ def lift_detections_to_3d(
     min_depth: float = _MIN_DEPTH_M,
     max_depth: float = _MAX_DEPTH_M,
     debug_name: str | None = None,
+    lidar_map_pose=None,
+    camera_map_pose=None,
 ) -> list[LanePoints3D]:
     """Lift SAM3 full-image masks to 3D lane points via LiDAR projection.
 
@@ -65,6 +94,9 @@ def lift_detections_to_3d(
     Coordinate mapping (native pixel → mask pixel):
         mask_u = (pixel_u_native - crop_xmin) * rescale_factor
         mask_v = (pixel_v_native - crop_ymin) * rescale_factor
+
+    Uses ego-motion compensation when lidar_map_pose and camera_map_pose are
+    provided, matching the transform chain from insertion.py.
 
     Args:
         pts_vehicle: LiDAR points in vehicle frame, shape (N, 3).
@@ -78,6 +110,8 @@ def lift_detections_to_3d(
         min_score: Minimum confidence threshold.
         min_depth: Minimum depth in camera frame (meters).
         max_depth: Maximum depth in camera frame (meters).
+        lidar_map_pose: LiDAR's map_aligned_pose for ego-motion compensation.
+        camera_map_pose: Camera's vehicle_se3_map for ego-motion compensation.
 
     Returns:
         List of LanePoints3D, one per detected lane type.
@@ -105,8 +139,14 @@ def lift_detections_to_3d(
         pts_vehicle.shape[0],
     )
 
-    # Transform to camera frame once — reuse for depth filter and projection.
-    pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)  # (3, N)
+    # Transform to camera frame with ego-motion compensation when poses available.
+    if lidar_map_pose is not None and camera_map_pose is not None:
+        lidar_to_camera = _build_lidar_to_camera_transform(lidar_map_pose, camera_map_pose, cam_calib_data)
+        pts_camera = lidar_to_camera.apply(pts_vehicle.T)  # (3, N)
+    else:
+        _LOGGER.warning("  No ego poses — projecting without ego-motion compensation.")
+        pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)  # (3, N)
+
     depth = pts_camera[2]
     in_front = (depth > min_depth) & (depth < max_depth)
     front_idx = np.where(in_front)[0]
