@@ -11,10 +11,10 @@ Usage:
 
 
 import logging
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Final
-
 
 import click
 import numpy as np
@@ -53,6 +53,22 @@ from platforms.lakefs.client import LakeFS
 
 
 _LOGGER: Final = logging.getLogger(__name__)
+
+#: Fixed seed for reproducible frame subsampling (matches transform_pad.py).
+_SUBSAMPLE_SEED: Final = 42
+
+
+def _subsample_frames(frames: list, max_frames: int) -> list:
+    """Randomly subsample frames, preserving temporal order.
+
+    Uses the same seed and logic as transform_pad.py's subsample_sequence()
+    so the same frames are selected.
+    """
+    if max_frames < 0 or len(frames) <= max_frames:
+        return frames
+    indices = sorted(random.Random(_SUBSAMPLE_SEED).sample(range(len(frames)), max_frames))
+    _LOGGER.info("Subsampled to %d frame(s): indices=%s", len(indices), indices)
+    return [frames[i] for i in indices]
 
 
 def _get_lidar_points(frame, calibrations, platform):
@@ -169,9 +185,7 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, legend
                 input_row.identifiers, "platform", None,
             )
 
-            frames = input_row.frames
-            if max_frames > 0:
-                frames = frames[:max_frames]
+            frames = _subsample_frames(input_row.frames, max_frames)
 
             for frame_idx, frame in enumerate(frames):
                 frame_id = getattr(frame, "frame_id", None)
