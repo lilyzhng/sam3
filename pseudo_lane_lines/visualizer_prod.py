@@ -36,7 +36,7 @@ from autonomy.perception.labels.pseudo_lanelines.lift_2d_to_3d import (
     lift_detections_to_3d,
 )
 from autonomy.perception.labels.pseudo_lanelines.visualize_utils import (
-    save_side_by_side_visualization,
+    save_three_row_visualization,
     save_visualization,
 )
 from kits.ml.calibration.camera import CameraCalibrationData
@@ -404,19 +404,24 @@ def main(output_dir: Path, rows: int, max_frames: int, confidence: float, debug_
                 total_pts = sum(lp.num_points for lp in all_frame_results)
                 _LOGGER.info("  Frame %d: %d lane types, %d lane points.", frame_idx, len(all_frame_results), total_pts)
 
-                # Side-by-side visualization.
+                # 3-row visualization: SAM3 | LiDAR projection | BEV lifting.
                 sam_debug_path = None
+                lidar_proj_path = None
                 if frame_id:
                     for cam_name in laneline_config.default_camera_names:
-                        candidate = output_dir / f"{input_row.row_id}_{frame_id}_{cam_name}.png"
-                        if candidate.exists():
-                            sam_debug_path = candidate
+                        sam_candidate = output_dir / f"{input_row.row_id}_{frame_id}_{cam_name}.png"
+                        proj_candidate = output_dir / f"{input_row.row_id}_{frame_id}_{cam_name}_lidar_proj.jpg"
+                        if sam_candidate.exists():
+                            sam_debug_path = sam_candidate
+                        if proj_candidate.exists():
+                            lidar_proj_path = proj_candidate
+                        if sam_debug_path:
                             break
 
                 if all_frame_results:
-                    if sam_debug_path is not None:
-                        viz_path = output_dir / f"row{num_rows_processed}_frame{frame_idx}_side_by_side.jpg"
-                        save_side_by_side_visualization(all_frame_results, sam_debug_path, viz_path)
+                    if sam_debug_path is not None and lidar_proj_path is not None:
+                        viz_path = output_dir / f"row{num_rows_processed}_frame{frame_idx}_combined.jpg"
+                        save_three_row_visualization(all_frame_results, sam_debug_path, lidar_proj_path, viz_path)
                     else:
                         viz_path = output_dir / f"row{num_rows_processed}_frame{frame_idx}_bev.jpg"
                         save_visualization(all_frame_results, viz_path)
