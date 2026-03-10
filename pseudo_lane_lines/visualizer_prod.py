@@ -123,6 +123,9 @@ def _save_lidar_projection_overlay(
     img_h, img_w = img.shape[:2]
     valid = (px_u >= 0) & (px_u < img_w) & (px_v >= 0) & (px_v < img_h)
     vi = np.where(valid)[0]
+    if vi.size == 0:
+        _LOGGER.info("  No LiDAR pts in image bounds, skipping overlay.")
+        return
     for idx in vi:
         d = depth[front_idx[idx]]
         t = min(d / 80.0, 1.0)
