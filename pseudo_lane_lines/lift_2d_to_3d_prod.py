@@ -110,14 +110,17 @@ def lift_detections_to_3d(
     mask_u = (pixel_u_native - crop_xmin) * rescale_factor
     mask_v = (pixel_v_native - crop_ymin) * rescale_factor
 
-    # DEBUG: also try without crop offset to check if projection is already cropped.
-    mask_u_nocrop = pixel_u_native * rescale_factor
-    mask_v_nocrop = pixel_v_native * rescale_factor
-    _LOGGER.info(
-        "  DEBUG no-crop mapping: mask_u=[%.1f,%.1f] mask_v=[%.1f,%.1f]",
-        mask_u_nocrop.min(), mask_u_nocrop.max(),
-        mask_v_nocrop.min(), mask_v_nocrop.max(),
-    )
+    # DEBUG: distribution of LiDAR in mask-v bands.
+    for v_thresh in [200, 250, 280, 300]:
+        high_v = mask_v >= v_thresh
+        if high_v.any():
+            high_u = mask_u[high_v]
+            _LOGGER.info(
+                "  DEBUG v>=%d: %d pts, u range=[%.0f,%.0f]",
+                v_thresh, int(high_v.sum()), high_u.min(), high_u.max(),
+            )
+        else:
+            _LOGGER.info("  DEBUG v>=%d: 0 pts", v_thresh)
 
     _LOGGER.info(
         "  Projection: %d front pts, native u=[%.0f,%.0f] v=[%.0f,%.0f], "
