@@ -104,12 +104,18 @@ def _get_lidar_points(frame, calibrations, platform):
 @click.option("--start-frame", type=int, default=0, help="Frame index to start processing from.")
 @click.option("--confidence", type=float, default=0.6, help="SAM3 confidence threshold.")
 @click.option(
+    "--debug-projection",
+    is_flag=True,
+    default=False,
+    help="Skip SAM3; just overlay LiDAR projection on the raw camera image.",
+)
+@click.option(
     "--legend-mode",
     is_flag=True,
     default=False,
     help="Render detection labels as a legend in the top-right corner of debug images.",
 )
-def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confidence: float, legend_mode: bool) -> None:
+def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confidence: float, debug_projection: bool, legend_mode: bool) -> None:
     """Run SAM3 lane-line inference → LiDAR 3D lifting → save BEV visualizations."""
     check_credentials()
 
@@ -136,8 +142,10 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
         filters=P758_LOG_FILTERS,
     )
 
-    # Create SAM3 autolabeler directly — no transform wrapper.
-    sam_autolabeler = create_sam_autolabeler(autolabeler_config, lakefs)
+    # Create SAM3 autolabeler — skip if only debugging projection.
+    sam_autolabeler = None
+    if not debug_projection:
+        sam_autolabeler = create_sam_autolabeler(autolabeler_config, lakefs)
 
     # Hydrators: images for SAM3, LiDAR for lifting.
     image_hydrator = HydrationTransformationV2(process_images=True, process_radar=False, process_lidar=False)
@@ -230,6 +238,53 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                     if camera.image.data is None:
                         continue
 
+                    # Get camera calibration for projection.
+                    cam_calib_data = None
+                    for cam_calib in calibrations.cameras:
+                        if cam_calib.sensor_name == camera.sensor_name:
+                            cam_calib_data = CameraCalibrationData.from_data_model(cam_calib)
+                            break
+                    if cam_calib_data is None:
+                        _LOGGER.warning("No calibration for camera '%s'", camera.sensor_name)
+                        camera.image.data = None
+                        continue
+
+                    if debug_projection:
+                        # Skip SAM3 — just project LiDAR onto the raw camera image.
+                        import cv2
+                        raw_img = camera.image.data.copy()
+                        # Project LiDAR into camera.
+                        pts_camera = cam_calib_data.vehicle_se3_sensor.inverse().apply(pts_vehicle.T)
+                        depth = pts_camera[2]
+                        in_front = (depth > 1.0) & (depth < 80.0)
+                        front_idx = np.where(in_front)[0]
+                        if front_idx.size > 0:
+                            projected = cam_calib_data.project_world_onto_camera(
+                                pts_vehicle[front_idx].T, valid_points=False, return_transposed=False,
+                            )
+                            px_u = projected[0].astype(np.int32)
+                            px_v = projected[1].astype(np.int32)
+                            img_h, img_w = raw_img.shape[:2]
+                            valid = (px_u >= 0) & (px_u < img_w) & (px_v >= 0) & (px_v < img_h)
+                            vi = np.where(valid)[0]
+                            # Color by depth: near=red, far=blue.
+                            for idx in vi:
+                                d = depth[front_idx[idx]]
+                                t = min(d / 80.0, 1.0)
+                                color = (int(255 * (1 - t)), 0, int(255 * t))  # BGR: red→blue
+                                cv2.circle(raw_img, (px_u[idx], px_v[idx]), 2, color, -1)
+                            _LOGGER.info(
+                                "  Camera '%s': %d LiDAR pts projected, %d in image bounds",
+                                camera.sensor_name, front_idx.size, vi.size,
+                            )
+                        else:
+                            _LOGGER.warning("  Camera '%s': no front-facing LiDAR pts", camera.sensor_name)
+                        proj_name = f"{input_row.row_id}_{frame_id}_{camera.sensor_name}_lidar_proj.jpg"
+                        cv2.imwrite(str(output_dir / proj_name), cv2.cvtColor(raw_img, cv2.COLOR_RGB2BGR))
+                        _LOGGER.info("  Saved projection overlay: %s", proj_name)
+                        camera.image.data = None
+                        continue
+
                     # Crop + resize — same preprocessing as transform_pad.py lines 123-127.
                     image = Image.fromarray(
                         camera.image.data[
@@ -265,17 +320,6 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
                             legend_mode=legend_mode,
                         )
 
-                    # Get camera calibration for projection.
-                    cam_calib_data = None
-                    for cam_calib in calibrations.cameras:
-                        if cam_calib.sensor_name == camera.sensor_name:
-                            cam_calib_data = CameraCalibrationData.from_data_model(cam_calib)
-                            break
-                    if cam_calib_data is None:
-                        _LOGGER.warning("No calibration for camera '%s'", camera.sensor_name)
-                        camera.image.data = None
-                        continue
-
                     # Lift to 3D — direct mask lookup, no RLE.
                     lift_debug_name = f"{input_row.row_id}_{frame_id}_{camera.sensor_name}"
                     results = lift_detections_to_3d(
@@ -294,6 +338,9 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
 
                     # Free image memory.
                     camera.image.data = None
+
+                if debug_projection:
+                    continue
 
                 total_pts = sum(lp.num_points for lp in all_frame_results)
                 _LOGGER.info("  Frame %d: %d lane types, %d lane points.", frame_idx, len(all_frame_results), total_pts)
