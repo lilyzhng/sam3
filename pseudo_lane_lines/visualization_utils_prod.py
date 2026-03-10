@@ -254,32 +254,36 @@ def save_three_row_visualization(
    ref_img = lidar_img if lidar_img is not None else sam_img
    ref_h, ref_w = ref_img.shape[:2]
 
+   # Each cell is the same size: ref_w x ref_h (+ title bar).
    title_h = 30
-   panels = []
+   cell_h = ref_h + title_h
 
-   # Column 1: SAM3 inference — resize to match native camera resolution.
-   if sam_img is not None:
-       sam_resized = cv2.resize(sam_img, (ref_w, ref_h))
-       panel = np.zeros((ref_h + title_h, ref_w, 3), dtype=np.uint8)
-       panel[title_h:, :] = sam_resized
-       cv2.putText(panel, "SAM3 2D Masks", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-       panels.append(panel)
+   def _make_panel(img: npt.NDArray[np.uint8], title: str) -> npt.NDArray[np.uint8]:
+       panel = np.zeros((cell_h, ref_w, 3), dtype=np.uint8)
+       panel[title_h:, :] = cv2.resize(img, (ref_w, ref_h))
+       cv2.putText(panel, title, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+       return panel
 
-   # Column 2: LiDAR projection overlay — already at native resolution.
-   if lidar_img is not None:
-       panel = np.zeros((ref_h + title_h, ref_w, 3), dtype=np.uint8)
-       panel[title_h:, :] = lidar_img
-       cv2.putText(panel, "LiDAR Projection", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-       panels.append(panel)
+   # Row 1: SAM3 Masks | LiDAR Projection
+   left = _make_panel(sam_img, "SAM3 2D Masks") if sam_img is not None else np.zeros((cell_h, ref_w, 3), dtype=np.uint8)
+   right = _make_panel(lidar_img, "LiDAR Projection") if lidar_img is not None else np.zeros((cell_h, ref_w, 3), dtype=np.uint8)
+   row1 = np.hstack([left, right])
 
-   # Column 3: BEV 3D lifting — square, same height as camera panels.
-   bev_size = ref_h + title_h
-   bev = draw_bev(lane_points_list, bev_size_px=bev_size)
+   # Row 2: BEV centered (same width as one cell, black padding on sides).
    total_pts = sum(lp.num_points for lp in lane_points_list)
-   cv2.putText(bev, f"({total_pts} pts)", (10, bev_size - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-   panels.append(bev)
+   bev = draw_bev(lane_points_list, bev_size_px=ref_w)
+   bev_panel = np.zeros((cell_h, ref_w, 3), dtype=np.uint8)
+   # Fit square BEV into cell_h x ref_w (may need to resize if aspect differs).
+   bev_resized = cv2.resize(bev, (ref_w, ref_h))
+   bev_panel[title_h:, :] = bev_resized
+   cv2.putText(bev_panel, f"BEV 3D Lifting ({total_pts} pts)", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-   vis = np.hstack(panels)
+   # Center BEV in the full row width (2 * ref_w).
+   row2 = np.zeros((cell_h, ref_w * 2, 3), dtype=np.uint8)
+   x_offset = ref_w // 2
+   row2[:, x_offset:x_offset + ref_w, :] = bev_panel
+
+   vis = np.vstack([row1, row2])
 
    output_path.parent.mkdir(parents=True, exist_ok=True)
    cv2.imwrite(str(output_path), vis)
