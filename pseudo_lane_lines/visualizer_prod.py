@@ -173,23 +173,24 @@ def main(output_dir: Path, rows: int, max_frames: int, start_frame: int, confide
             end_frame = start_frame + max_frames if max_frames >= 0 else len(all_frames)
             end_frame = min(end_frame, len(all_frames))
 
-            # Hydrate ALL frames' LiDAR sequentially (cheap) so the hydrator
-            # reads files in order. This prevents the mismatch that occurs when
-            # skipping frames — the hydrator loads data sequentially regardless
-            # of which frame object you pass.
+            # Hydrate LiDAR sequentially up to the last frame we need.
+            # The hydrator expects sequential calls, so we can't skip frames.
+            # LiDAR hydration is cheap (just loading point clouds); SAM3 is the
+            # expensive part and only runs on selected frames.
             _LOGGER.info(
-                "Hydrating LiDAR for all %d frames (processing frames %d-%d)...",
-                len(all_frames), start_frame, end_frame - 1,
+                "Hydrating LiDAR for frames 0-%d (processing frames %d-%d)...",
+                end_frame - 1, start_frame, end_frame - 1,
             )
-            for frame in all_frames:
+            for i in range(end_frame):
+                frame = all_frames[i]
                 if hasattr(frame, "lidars") and frame.lidars:
                     for lidar_obs in frame.lidars:
                         try:
                             lidar_hydrator(lidar_obs)
                         except Exception as e:
                             _LOGGER.warning(
-                                "Failed to hydrate LiDAR '%s': %s",
-                                getattr(lidar_obs, "sensor_name", "unknown"), e,
+                                "Failed to hydrate LiDAR '%s' (frame %d): %s",
+                                getattr(lidar_obs, "sensor_name", "unknown"), i, e,
                             )
 
             # Only run SAM3 + lifting on the selected frame range.
