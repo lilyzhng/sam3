@@ -250,34 +250,36 @@ def save_three_row_visualization(
        save_visualization(lane_points_list, output_path)
        return
 
-   # Use whichever image is available to determine target width.
-   ref_img = sam_img if sam_img is not None else lidar_img
+   # Use LiDAR overlay dimensions as the reference — it's at native camera resolution.
+   ref_img = lidar_img if lidar_img is not None else sam_img
    target_w = ref_img.shape[1]
+   target_h = ref_img.shape[0]
 
    title_h = 30
    panels = []
 
-   # Row 1: SAM3 inference.
+   # Row 1: SAM3 inference — resize to match native camera resolution.
    if sam_img is not None:
-       sam_resized = cv2.resize(sam_img, (target_w, int(sam_img.shape[0] * target_w / sam_img.shape[1])))
-       panel = np.zeros((sam_resized.shape[0] + title_h, target_w, 3), dtype=np.uint8)
+       sam_resized = cv2.resize(sam_img, (target_w, target_h))
+       panel = np.zeros((target_h + title_h, target_w, 3), dtype=np.uint8)
        panel[title_h:, :] = sam_resized
        cv2.putText(panel, "SAM3 2D Masks", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
        panels.append(panel)
 
-   # Row 2: LiDAR projection overlay.
+   # Row 2: LiDAR projection overlay — already at native resolution.
    if lidar_img is not None:
-       lidar_resized = cv2.resize(lidar_img, (target_w, int(lidar_img.shape[0] * target_w / lidar_img.shape[1])))
-       panel = np.zeros((lidar_resized.shape[0] + title_h, target_w, 3), dtype=np.uint8)
-       panel[title_h:, :] = lidar_resized
+       panel = np.zeros((target_h + title_h, target_w, 3), dtype=np.uint8)
+       panel[title_h:, :] = lidar_img
        cv2.putText(panel, "LiDAR Projection Overlay", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
        panels.append(panel)
 
-   # Row 3: BEV 3D lifting.
+   # Row 3: BEV 3D lifting — shorter height, crop empty far-range space.
    bev = draw_bev(lane_points_list, bev_size_px=target_w)
+   bev_crop_top = int(target_w * 0.4)
+   bev_cropped = bev[bev_crop_top:, :]
    total_pts = sum(lp.num_points for lp in lane_points_list)
-   panel = np.zeros((bev.shape[0] + title_h, target_w, 3), dtype=np.uint8)
-   panel[title_h:, :] = bev
+   panel = np.zeros((bev_cropped.shape[0] + title_h, target_w, 3), dtype=np.uint8)
+   panel[title_h:, :] = bev_cropped
    cv2.putText(panel, f"BEV 3D Lifting ({total_pts} pts)", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
    panels.append(panel)
 
