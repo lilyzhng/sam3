@@ -252,38 +252,34 @@ def save_three_row_visualization(
 
    # Use LiDAR overlay dimensions as the reference — it's at native camera resolution.
    ref_img = lidar_img if lidar_img is not None else sam_img
-   target_w = ref_img.shape[1]
-   target_h = ref_img.shape[0]
+   ref_h, ref_w = ref_img.shape[:2]
 
    title_h = 30
    panels = []
 
-   # Row 1: SAM3 inference — resize to match native camera resolution.
+   # Column 1: SAM3 inference — resize to match native camera resolution.
    if sam_img is not None:
-       sam_resized = cv2.resize(sam_img, (target_w, target_h))
-       panel = np.zeros((target_h + title_h, target_w, 3), dtype=np.uint8)
+       sam_resized = cv2.resize(sam_img, (ref_w, ref_h))
+       panel = np.zeros((ref_h + title_h, ref_w, 3), dtype=np.uint8)
        panel[title_h:, :] = sam_resized
        cv2.putText(panel, "SAM3 2D Masks", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
        panels.append(panel)
 
-   # Row 2: LiDAR projection overlay — already at native resolution.
+   # Column 2: LiDAR projection overlay — already at native resolution.
    if lidar_img is not None:
-       panel = np.zeros((target_h + title_h, target_w, 3), dtype=np.uint8)
+       panel = np.zeros((ref_h + title_h, ref_w, 3), dtype=np.uint8)
        panel[title_h:, :] = lidar_img
-       cv2.putText(panel, "LiDAR Projection Overlay", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+       cv2.putText(panel, "LiDAR Projection", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
        panels.append(panel)
 
-   # Row 3: BEV 3D lifting — shorter height, crop empty far-range space.
-   bev = draw_bev(lane_points_list, bev_size_px=target_w)
-   bev_crop_top = int(target_w * 0.4)
-   bev_cropped = bev[bev_crop_top:, :]
+   # Column 3: BEV 3D lifting — square, same height as camera panels.
+   bev_size = ref_h + title_h
+   bev = draw_bev(lane_points_list, bev_size_px=bev_size)
    total_pts = sum(lp.num_points for lp in lane_points_list)
-   panel = np.zeros((bev_cropped.shape[0] + title_h, target_w, 3), dtype=np.uint8)
-   panel[title_h:, :] = bev_cropped
-   cv2.putText(panel, f"BEV 3D Lifting ({total_pts} pts)", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-   panels.append(panel)
+   cv2.putText(bev, f"({total_pts} pts)", (10, bev_size - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+   panels.append(bev)
 
-   vis = np.vstack(panels)
+   vis = np.hstack(panels)
 
    output_path.parent.mkdir(parents=True, exist_ok=True)
    cv2.imwrite(str(output_path), vis)
