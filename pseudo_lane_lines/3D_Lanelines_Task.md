@@ -62,10 +62,11 @@ Outputs:
 
 Regardless of which front-end detector is used, raw per-frame outputs are insufficient for auto-labeling and require a second refinement stage. 
 
-1. Accumulating observations along the trajectory: Multiple frames viewing the same lane are fused in world coordinates, filling spatial gaps and increasing point density.  
-2. Denoising via redundancy: Outliers (false positives, misaligned points) are suppressed when they don't recur across frames; consensus geometry emerges from repeated observations.  
-3. Re-associating across tracking resets: Geometry-based association (3D proximity, tangent consistency) links fragments that the front-end tracker separated, producing stable global IDs.  
-4. Fitting smooth curves: Raw point clouds are converted into parametric curves (splines or polylines) that are smooth, continuous, and easy to edit.
+1. Accumulating observations along the trajectory: Multiple frames viewing the same lane are fused in world coordinates, filling spatial gaps and increasing point density.
+2. Denoising via redundancy: Outliers (false positives, misaligned points) are suppressed when they don't recur across frames; consensus geometry emerges from repeated observations.
+3. Per-fragment spline fitting: Fit a smooth parametric curve (spline) to each track fragment's denoised point cloud. This produces clean endpoint positions and tangent directions needed for association.
+4. Re-associating across tracking resets: Geometry-based association uses the fitted spline geometry (endpoint proximity, tangent consistency) to link fragments that the front-end tracker separated, producing stable global IDs.
+5. Final curve re-fitting: After merging associated fragments, re-fit splines to the combined point clouds to produce the final smooth, continuous polyline output.
 
 ### 3.3.1 Architecture
 
@@ -75,12 +76,12 @@ Regardless of which front-end detector is used, raw per-frame outputs are insuff
 | ----- | ----- | ----- |
 | Delta | Detection module is trained in-house (3D/BEV output) | Detection module is off-the-shelf (2D masks \+ tracking) |
 | Time | Medium (needs training integration \+ iterations) | Fast (mostly inference \+ projection \+ fitting) |
-| Shared required work | Same for both: pose alignment → aggregation/denoise → association/re-ID → polyline/spline fitting | Same for both: pose alignment → aggregation/denoise → association/re-ID → polyline/spline fitting |
+| Shared required work | Same for both: pose alignment → aggregation/denoise → per-fragment spline fit → association/re-ID → final spline re-fit | Same for both: pose alignment → aggregation/denoise → per-fragment spline fit → association/re-ID → final spline re-fit |
 | Engineering \+ compute cost | High (training infra \+ GPU cycles) | Low (inference only) |
 | Impact to existing 3DOD | High (observed negative transfer/regression in the past) | Low (decoupled from 3DOD training) |
 | Performance | Higher if we have good quality labels and can iterate safely | Good for MVP; may need finetune/training to match best-in-class |
 
-Trade-off: Option 1 vs 2 is mainly a choice of the front-end detector \+ impact on 3DOD \+ infra cost. The post-detection refinement pipeline (aggregation, association, polyline fitting) is required either way.
+Trade-off: Option 1 vs 2 is mainly a choice of the front-end detector \+ impact on 3DOD \+ infra cost. The post-detection refinement pipeline (aggregation, denoising, per-fragment spline fitting, association, final re-fitting) is required either way.
 
 Context: In HulkUMv1, adding a lane-line-specific head ([BEV-laneDet](https://github.com/latai-pd/av/blob/main/kits/ml/pytorch/heads/lanes/bev_lane_head.py)) impacted object detection performance. Even with detached gradients, regression was observed. Alternating training regimes (training 3DOD head for N iterations with lane head fixed, then vice versa) could mitigate this.
 
@@ -117,26 +118,82 @@ Parameters (initial values):
 
 Output: Cleaned, downsampled point clouds per track.
 
-**3\. Geometry-Based Association**  
+**3\. Geometry-Based Association**
 Link track fragments into globally consistent lane instances. The front-end tracker provides locally consistent IDs, but tracking resets (occlusions, scene cuts) fragment physical lanes into multiple tracks. This stage re-associates fragments using geometric cues.
 
-Association Criteria:
+**Offline ordering note:** In the original design, spline fitting runs before association to provide endpoint tangents. For our offline pipeline, association runs before spline fitting — with a full slice accumulated, endpoint positions and tangent directions can be computed directly from the dense point cloud (PCA or local line fit on the last ~5 points). This avoids fitting splines twice (per-fragment + post-merge).
 
-| Criterion | Implementation |
-| :---- | :---- |
-| 3D proximity | Endpoint distance \< threshold (e.g., 2 m) |
-| Tangent consistency | Direction at endpoints aligns within ±15° |
-| Overlap ratio | If tracks overlap spatially, require \> 70% point overlap to merge |
-| Lateral sequence consistency | If lane A is left of lane B in one segment, it should remain left of B in the associated segment |
+**Reference: MonoLaneMapping association approach (online)**
 
-Association Algorithm:
+MonoLaneMapping ([HKUST, IROS 2023](https://github.com/HKUST-Aerial-Robotics/MonoLaneMapping)) uses an online per-frame approach: detect → associate → fit spline → optimize. Their association code (`lane_slam/assoc_utils.py`, `KnnASSOC` class) is worth studying. Key ideas that apply to our offline case:
 
-1. Build candidate pairs: (track\_i, track\_j) where endpoints are within proximity threshold.  
-2. Score each pair by tangent alignment \+ overlap.  
-3. Greedy or Hungarian matching to assign global lane IDs.  
-4. Handle merges/splits: If a track's points diverge (e.g., at a lane split), create new global IDs for the branches.
+*Data representation:* Each lane in their map is a `LaneFeature` (`lane_slam/lane_feature.py`) with: ordered 3D points, a category (lane type), a KDTree for fast neighbor queries, and Catmull-Rom spline control points. They build a KDTree per lane for distance queries during association.
 
-Output: Global lane ID assigned to each point cloud.
+*Association scoring (`KnnASSOC.association`):*
+- For each detection lane, query every map landmark lane's KDTree with the detection's points
+- Per-point distance threshold is adaptive — based on range from ego, yaw uncertainty, and translation uncertainty (`get_dist_thd`)
+- Score = `mean(matched_dists) * sqrt(total_pts / matched_pts)` — penalizes both large distances and low match ratios. If score > ideal threshold, reject the pair
+- Only same-category lanes are compared (line 294: `if self.lm_categories[j] != self.det_categories[i]: continue`)
+
+*Lateral consistency (`construct_consistency`):*
+- For each candidate pair (landmark_i ↔ detection_j), check that it's consistent with all other candidate pairs
+- Uses `left_or_right()` — takes midpoint of lane A, forms a line from lane B's endpoints, checks which side A is on
+- If landmark_i is left of landmark_k, then detection_j should be left of detection_l. Violations reduce the consistency score
+- Consistency matrix C is multiplied element-wise with the affinity scores: `assoc_scores_w = assoc_scores * C`
+
+*Matching algorithm:* Hungarian (Kuhn-Munkres) via `km_matcher.py` for optimal assignment. Falls back to greedy column-max if not using KM.
+
+*Post-merge NMS (`lane_mapping.py:lane_nms`, `post_merge_lane`):*
+- Removes lanes observed < 4 times in their first few frames (suppresses false positives)
+- Overlap check: if lane A overlaps >70% with lane B and A is smaller, remove A (`overlap_ratio` uses KDTree ball query with `lane_width/2` threshold)
+
+*What's different for us (offline):*
+- They associate per-frame detections against a growing map. We associate accumulated fragments against each other — all fragments are known upfront.
+- They fit splines first (control points at chord intervals), then use them for association in future frames. We have dense point clouds from accumulation, so we can compute endpoints/tangents directly from points (PCA) and fit splines once after association.
+- Their adaptive distance threshold (`get_dist_thd`) accounts for ego-pose uncertainty at detection time. Our points are already accumulated in world frame, so the threshold can be simpler (fixed or based on accumulation density).
+
+**Input/Output Contract:**
+
+```python
+# Input: dict of track_id → denoised 3D point cloud (from denoise.py)
+# Each value is an Nx3 numpy array of (x, y, z) in world frame, sorted roughly along direction of travel.
+fragments: dict[int, np.ndarray]
+
+# Example: SAM3 tracking reset splits one physical lane into two fragments
+fragments = {
+    5:  np.array([[100.0, 0.1, 0.0], [103.0, 0.1, 0.0], ...]),   # frames 1-30
+    12: np.array([[130.0, 0.2, 0.0], [133.0, 0.2, 0.0], ...]),   # frames 40-70
+    # These are actually the same lane, but SAM3 lost tracking at frame 31
+}
+
+# Output: dict of global_lane_id → merged Nx3 point cloud (ready for spline fitting)
+merged_lanes: dict[int, np.ndarray]
+```
+
+**Step 1: Extract endpoints + tangents from each fragment.**
+Sort each fragment's point cloud along its principal axis (PCA). Take the first/last ~5 points, average to get endpoint positions. Fit a line through those ~5 points to get the tangent direction vector. No spline fitting needed — dense offline point clouds make this reliable.
+
+**Step 2: Build candidate pairs.**
+For every pair of fragments (i, j), check all four endpoint combinations (end\_i↔start\_j, end\_i↔end\_j, start\_i↔start\_j, start\_i↔end\_j). A pair is a candidate if any endpoint combination is within the proximity threshold.
+
+**Step 3: Score each candidate pair.**
+
+| Criterion | How | Pass condition |
+| :---- | :---- | :---- |
+| Endpoint distance | Euclidean distance between matched endpoints | < 2 m |
+| Tangent consistency | Angle between tangent vectors at matched endpoints | < 15° |
+| Overlap check | If fragments overlap spatially, compute point overlap ratio | > 70% to merge |
+| Lateral ordering | If lane A is left of lane B in one fragment, verify it stays left in the other | Consistent |
+
+Score = w₁ \* (1 - dist/max\_dist) + w₂ \* cos(angle)
+
+**Step 4: Match and assign global IDs.**
+Greedy matching (sort pairs by score, match best first) or Hungarian algorithm to assign global lane IDs. Concatenate matched fragments' point clouds.
+
+**Step 5: Handle merge/split detection.**
+If two candidate fragments both match the same endpoint of a third fragment but diverge from each other (angle between their tangents > threshold), this indicates a lane split. Do not merge — create new global IDs for each branch.
+
+Output: Global lane ID assigned to each merged point cloud.
 
 **4\. Curve Fitting**  
 Convert the fused, denoised point cloud into a smooth, parametric curve suitable for labeling output.
@@ -276,23 +333,33 @@ Deployment reference:
 
 ## 4.3 Timelines
 
-The below targets assume 1 engineer working sequentially. With a second engineer, the evaluation tasks (end-to-end eval script, ALFA dataset curation, online vs. offboard benchmark) can be developed in parallel since they have no code dependency on the pipeline.
+Work is split between two engineers, with backend refinement modules developed in parallel using synthetic test data (no dependency on LiDAR lifting results). Real LiDAR data is only needed for integration testing and parameter tuning.
 
-| Priority | Component | Target |
-| :---- | :---- | :---- |
-| P0 | SAM3 2D detection — run SAM3 inference on PV images to produce per-frame 2D lane masks | Done |
-| P0 | SAM3 2D tracking — track lane mask instances across frames to produce consistent track IDs | S2.3 |
-| P0 | 2D → 3D lifting (lift\_2d\_to\_3d.py) — project 2D lane masks to 3D via LiDAR depth \+ calibration | S2.4 |
-| P0 | Pose-aligned accumulation (accumulate\_observations.py) — transform per-frame 3D points to world frame, group by track\_id | S3.1 |
-| P0 | Multi-frame denoising (denoise.py) — outlier removal, voxel downsampling, observation count filtering | S3.1 |
-| P0 | Geometry-based association (associate\_fragments.py) — re-associate track fragments via 3D proximity, tangent consistency, overlap | S3.2 |
-| P0 | Spline fitting (spline\_fit.py) — fit Catmull-Rom splines (chord 3.0 m, tau 0.5), resample to polyline at 0.5 m | S3.2 |
-| P0 | Implement end-to-end eval script (4.4.2) — final 3D lanes vs GT: recall, precision, F-score, X/Z error | S3.2 |
-| P0 | CLI integration — add mode flag to generate\_pseudo\_cuboids\_cli.py, extend AutoLabelerResult, OpenLabel JSON output | S3.3 |
-| P0 | ALFA eval dataset curation (4.4.4) — curate basic \+ challenging scene sets for failure mode analysis | S3.3 |
-| P0 | Run end-to-end benchmarking — evaluate on ALFA eval sets, report metrics | S3.3 |
-| P1 | Online vs. offboard baseline benchmark (4.4.3) — compare offboard auto-labels against onboard UM on same slices | S3.4 |
-| P0 | Deploy to dagster image — follow existing cuboid prelabeler pattern, validate on test slices in staging | S3.5 |
+**Owner assignments:**
+
+* **Lily** — Frontend pipeline (lifting, accumulation, denoising) + CLI integration + eval
+* **Yukai** — Geometry-based association (research input format, implement matching/merging logic). Reference: `latai-pd/av/autonomy/scene_estimation/lane_line_smoothing/` (SE's online association code — takes fitted lane lines; ours takes raw point clouds since we're offline). Yukai should assume all input is already in world frame.
+* **Spline fitting** — TBD (assign after association is underway)
+
+**Offline pipeline ordering note:** The original design describes fitting splines per-fragment before association (to get endpoint tangents for matching). For our offline pipeline, association can run before spline fitting — with a full slice accumulated, endpoint positions and tangent directions can be computed directly from the dense point cloud (PCA or local line fit on last ~5 points). This means we fit splines only once on the fully merged point cloud per lane, rather than fitting twice (per-fragment + post-merge re-fit).
+
+**Parallel development strategy:** All backend modules (denoising, spline fitting, association) can be developed and unit-tested with synthetic Nx3 numpy point clouds — no dependency on the lifting code. Integration testing with real LiDAR data happens after lifting is complete.
+
+| Priority | Component | Owner | Target |
+| :---- | :---- | :---- | :---- |
+| P0 | SAM3 2D detection — run SAM3 inference on PV images to produce per-frame 2D lane masks | Lily | Done |
+| P0 | SAM3 2D tracking — track lane mask instances across frames to produce consistent track IDs | Lily | S2.3 |
+| P0 | 2D → 3D lifting (lift\_2d\_to\_3d.py) — project 2D lane masks to 3D via LiDAR depth \+ calibration | Lily | S2.4 |
+| P0 | Pose-aligned accumulation (accumulate\_observations.py) — transform per-frame 3D points to world frame, group by track\_id | Lily | S3.1 |
+| P0 | Multi-frame denoising (denoise.py) — outlier removal, voxel downsampling, observation count filtering | Lily | S3.1 |
+| P0 | Geometry-based association (associate\_fragments.py) — re-associate track fragments via 3D proximity, tangent consistency, overlap. Yukai to research best input format (points vs clusters) and implement. Input is world-frame point clouds (not fitted lane lines). Reference: SE's `lane_line_smoothing/` | Yukai | S3.2 |
+| P0 | Spline fitting (spline\_fit.py) — fit Catmull-Rom splines (chord 3.0 m, tau 0.5), resample to polyline at 0.5 m | TBD | S3.2 |
+| P0 | Implement end-to-end eval script (4.4.2) — final 3D lanes vs GT: recall, precision, F-score, X/Z error | Lily | S3.2 |
+| P0 | CLI integration — add mode flag to generate\_pseudo\_cuboids\_cli.py, extend AutoLabelerResult, OpenLabel JSON output | Lily | S3.3 |
+| P0 | ALFA eval dataset curation (4.4.4) — curate basic \+ challenging scene sets for failure mode analysis | Lily | S3.3 |
+| P0 | Run end-to-end benchmarking — evaluate on ALFA eval sets, report metrics | Lily | S3.3 |
+| P1 | Online vs. offboard baseline benchmark (4.4.3) — compare offboard auto-labels against onboard UM on same slices | Lily | S3.4 |
+| P0 | Deploy to dagster image — follow existing cuboid prelabeler pattern, validate on test slices in staging | Lily | S3.5 |
 
 ### 4.3.1 Detailed Status Tracking
 
@@ -301,9 +368,9 @@ The below targets assume 1 engineer working sequentially. With a second engineer
 | SAM3 2D detection (`sam3_lane_inference.py`) | Done | HF Transformers API instability across versions; MPS/CPU fallback needed for local dev | Native SAM3 repo on CUDA is more stable than HF Transformers wrapper; text prompts outperform point prompts for lane lines | Dual backend: native SAM3 on CUDA, HF Transformers on MPS/CPU; lazy imports to avoid hard dependency |
 | SAM3 2D tracking | In Progress | Tracking resets at occlusions fragment lane IDs; video mode requires native SAM3 repo (not HF) | SAM3 video mode propagates masks across frames with consistent object IDs; prompt_interval=10 balances coverage vs speed | Use SAM3 video mode with periodic re-prompting; downstream association stage (S3.2) will re-link fragments |
 | 2D → 3D lifting (`lift_2d_to_3d.py`) | Done | Lane lines are thin — expect 10-50 LiDAR hits per lane per frame; overlapping masks from multiple prompts | nuScenes 4-step transform chain validated against devkit `map_pointcloud_to_image()`; ego-frame output aligns with downstream accumulation | Depth filter 1-80m; highest-confidence mask wins for overlapping regions; diagnostics log point counts per lane type |
-| Pose-aligned accumulation | Not Started | — | — | — |
+| Pose-aligned accumulation | Done (external data) | — | LiDAR accumulation was quick on external data; ego→world transform straightforward | Lily handles ego→world transform; downstream modules (association) can assume world-frame input |
 | Multi-frame denoising | Not Started | — | — | — |
-| Geometry-based association | Not Started | — | — | — |
+| Geometry-based association | Not Started (Yukai) | Input format TBD — raw points vs pre-clustered; SE's online code takes fitted lanes but we have raw point clouds (offline) | Yukai to research: (1) should input be points or clusters, (2) does within-cloud splitting (e.g. DBSCAN) help before cross-cloud association | Reference SE code: `lane_line_smoothing/`. Same criteria (proximity, tangent, overlap, lateral ordering) but different input representation |
 | Spline fitting | Not Started | — | — | — |
 | End-to-end eval script | Not Started | — | — | — |
 | CLI integration | Not Started | — | — | — |

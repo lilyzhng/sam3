@@ -158,6 +158,26 @@ def lift_detections_to_3d(
             mask_true_cols[0] if len(mask_true_cols) > 0 else -1,
             mask_true_cols[-1] if len(mask_true_cols) > 0 else -1,
         )
+        # Count LiDAR points in the mask's True bounding region.
+        if len(mask_true_rows) > 0 and len(mask_true_cols) > 0:
+            in_overlap = (
+                (v_int >= mask_true_rows[0]) & (v_int <= mask_true_rows[-1])
+                & (u_int >= mask_true_cols[0]) & (u_int <= mask_true_cols[-1])
+            )
+            overlap_count = int(in_overlap.sum())
+            # Check what mask values those overlap points see.
+            if overlap_count > 0:
+                ov_v = v_int[in_overlap]
+                ov_u = u_int[in_overlap]
+                ov_vals = mask[ov_v, ov_u]
+                _LOGGER.info(
+                    "    Overlap region: %d LiDAR pts, mask vals: %d True / %d False, "
+                    "dtype=%s, sample mask[%d,%d]=%s",
+                    overlap_count, int(ov_vals.sum()), int((~ov_vals).sum()),
+                    mask.dtype, ov_v[0], ov_u[0], mask[ov_v[0], ov_u[0]],
+                )
+            else:
+                _LOGGER.info("    Overlap region: 0 LiDAR pts in True bbox")
         _LOGGER.info(
             "    LiDAR u_int range=[%d,%d], v_int range=[%d,%d], %d in-bounds, %d hits",
             u_int.min(), u_int.max(), v_int.min(), v_int.max(),
